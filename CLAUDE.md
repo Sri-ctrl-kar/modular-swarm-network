@@ -6,7 +6,9 @@ A* admissibility proof and the synthetic-city assumptions.
 ## Status
 
 Milestone 1 (deterministic city + network foundation) is complete and green:
-64 test functions / 105 parametrized cases, all passing. Next milestone is
+75 test functions / 116 parametrized cases, all passing (M1.1 added
+`tests/test_route_switch_regression.py`, proving congestion can change the
+optimal route and that restoring traffic restores it). Next milestone is
 **M2: passenger demand simulation** — not started. Do not implement pods,
 platooning, swarm control, LLM integration or a dashboard yet.
 
