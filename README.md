@@ -154,10 +154,22 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-64 test functions (105 cases with parametrization) across models, network,
-routing, determinism and edge cases. Highlights: A* and Dijkstra costs match for
-**all 462 ordered node pairs**, and again under random congestion; the heuristic is
-checked for admissibility against true costs from every node to every goal.
+75 test functions (116 cases with parametrization) across models, network,
+routing, determinism, edge cases and route-switch regression. Highlights: A* and
+Dijkstra costs match for **all 462 ordered node pairs**, and again under random
+congestion; the heuristic is checked for admissibility against true costs from
+every node to every goal.
+
+`tests/test_route_switch_regression.py` (M1.1) pins the end-to-end behaviour that
+congestion can change the chosen route. On the seed-42 baseline,
+North Station -> East Hub is normally `E009 -> E011` via Northgate Junction
+(13.93 min); driving `E011` to utilization 3.0 (4500 veh/h against a capacity of
+1500, multiplier x5.15) makes the router switch to the fully edge-disjoint
+`E013 -> E003` via Central Station (17.13 min, versus 45.16 min for the original
+path under the same traffic). The tests assert the switch happens, that the new
+route is genuinely cheaper under the modified costs, that Dijkstra and A* still
+agree before/after/restored, that repeated executions are bit-identical, and that
+restoring the original traffic restores the original route and cost exactly.
 
 ## 10. Known limitations
 
