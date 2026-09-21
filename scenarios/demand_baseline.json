@@ -1,0 +1,145 @@
+{
+  "schema_version": 1,
+  "profile_id": "baseline",
+  "description": "Whole-day synthetic demand: morning and evening peaks around a quieter midday and a low off-peak night.",
+  "data_provenance": "SYNTHETIC — passengers, trips, party sizes and time-of-day weights are invented for prototyping. This is a synthetic demand model for simulation and is not calibrated to real-world city mobility data.",
+  "assumptions": {
+    "commuter_share": 0.6,
+    "gravity_distance_exponent": 1.0,
+    "gravity_note": "destination weight = attraction / (1 + straight_line_km) ** exponent; straight-line km is used for weighting only, never as travel cost",
+    "party_size_distribution": {
+      "1": 0.62,
+      "2": 0.22,
+      "3": 0.1,
+      "4": 0.06
+    },
+    "home_role_weights": {
+      "residential": 8.0,
+      "employment": 0.0,
+      "hub": 1.0,
+      "mixed": 2.0,
+      "through": 0.0
+    },
+    "default_roles_by_node_type": {
+      "station": "mixed",
+      "terminal": "hub",
+      "intersection": "through"
+    },
+    "node_roles": {
+      "airport": "hub",
+      "central_station": "hub",
+      "east_hub": "hub",
+      "industrial_zone": "employment",
+      "market": "mixed",
+      "north_station": "hub",
+      "residential_north": "residential",
+      "residential_south": "residential",
+      "riverside": "residential",
+      "tech_park": "employment",
+      "university": "employment",
+      "west_hub": "hub"
+    }
+  },
+  "time_buckets": [
+    {
+      "name": "morning_peak",
+      "windows": [
+        [
+          360.0,
+          600.0
+        ]
+      ],
+      "trip_share": 0.35,
+      "production": {
+        "residential": 6.0,
+        "employment": 0.6,
+        "hub": 1.0,
+        "mixed": 1.5,
+        "through": 0.2
+      },
+      "attraction": {
+        "residential": 0.4,
+        "employment": 5.0,
+        "hub": 3.0,
+        "mixed": 1.5,
+        "through": 0.2
+      }
+    },
+    {
+      "name": "midday",
+      "windows": [
+        [
+          600.0,
+          960.0
+        ]
+      ],
+      "trip_share": 0.22,
+      "production": {
+        "residential": 1.5,
+        "employment": 1.5,
+        "hub": 1.5,
+        "mixed": 2.0,
+        "through": 0.3
+      },
+      "attraction": {
+        "residential": 1.2,
+        "employment": 1.5,
+        "hub": 2.0,
+        "mixed": 2.5,
+        "through": 0.3
+      }
+    },
+    {
+      "name": "evening_peak",
+      "windows": [
+        [
+          960.0,
+          1200.0
+        ]
+      ],
+      "trip_share": 0.31,
+      "production": {
+        "residential": 0.5,
+        "employment": 5.0,
+        "hub": 3.0,
+        "mixed": 1.8,
+        "through": 0.2
+      },
+      "attraction": {
+        "residential": 6.0,
+        "employment": 0.5,
+        "hub": 1.2,
+        "mixed": 1.5,
+        "through": 0.2
+      }
+    },
+    {
+      "name": "off_peak",
+      "windows": [
+        [
+          1200.0,
+          1440.0
+        ],
+        [
+          0.0,
+          360.0
+        ]
+      ],
+      "trip_share": 0.12,
+      "production": {
+        "residential": 1.5,
+        "employment": 0.8,
+        "hub": 1.2,
+        "mixed": 1.5,
+        "through": 0.3
+      },
+      "attraction": {
+        "residential": 1.5,
+        "employment": 0.6,
+        "hub": 1.5,
+        "mixed": 1.8,
+        "through": 0.3
+      }
+    }
+  ]
+}
