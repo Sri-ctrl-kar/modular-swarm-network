@@ -5,8 +5,8 @@ A* admissibility proof and the synthetic-city assumptions.
 
 ## Status
 
-Milestones 1, 1.1, 2 and 3 are complete and green: 327 test functions /
-480 parametrized cases, all passing.
+Milestones 1, 1.1, 2, 3 and 4 are complete and green: 428 test functions /
+614 parametrized cases, all passing.
 
 * **M1** — deterministic city + network foundation.
 * **M1.1** — `tests/test_route_switch_regression.py`: congestion can change the
@@ -15,11 +15,14 @@ Milestones 1, 1.1, 2 and 3 are complete and green: 327 test functions /
   trip requests, an OD matrix, time-of-day profiles and routing integration.
 * **M3** — `app/fleet/`: deterministic pod fleet — pods, assignment, discrete-tick
   movement, an approximated battery model and fleet metrics. Pods are
-  **independent**; there is no grouping.
+  **independent**; grouping lives in M4.
+* **M4** — `app/swarm/`: deterministic rule-based swarm formation, platoon
+  movement, splitting at divergence, swarm metrics, an independent-vs-swarm
+  comparison, and a **rebalancing hook only**.
 
-Next milestone is **M4: swarm formation / platooning** — not started. Do not
-implement swarm formation, platooning, magnetic linking, LLM integration or a
-dashboard yet.
+Next milestone is **M5: adaptive fleet rebalancing** — not started. Do not
+implement adaptive rebalancing, magnetic linking, LLM integration or a dashboard
+yet.
 
 ## Commands
 
@@ -34,6 +37,7 @@ python -m app.cli.main export-scenario --seed 42 --output scenarios/baseline.jso
 python -m app.cli.main demand-demo --profile baseline --passengers 1000
 python -m app.cli.main demand-demo --profile peak_hour --passengers 2000 --no-routing
 python -m app.cli.main fleet-demo --pods 100 --passengers 1000
+python -m app.cli.main swarm-demo --pods 100 --passengers 1000
 ```
 
 ## Invariants — do not break these
@@ -58,10 +62,10 @@ python -m app.cli.main fleet-demo --pods 100 --passengers 1000
    ≥ 1. Changing any of these means redoing the proof in `app/routing/costs.py`.
 4. **Assumptions live in `app/config.py`** and the scenario file, not inside
    algorithms. No magic numbers in routing or graph code.
-5. **Layering:** models ← network ← routing ← simulation ← demand ← fleet ← cli.
-   Never import downward-to-upward; in particular routing must never import
-   `app.demand`, and nothing below the fleet may import `app.fleet` (tests walk
-   the lower layers to enforce both).
+5. **Layering:** models ← network ← routing ← simulation ← demand ← fleet ←
+   swarm ← cli. Never import downward-to-upward: nothing below a layer may import
+   `app.demand`, `app.fleet` or `app.swarm` (tests walk the lower layers to
+   enforce all three).
 6. **Typed errors only** (`app/errors.py`); the CLI turns them into one clean
    line on stderr with exit code 1 (no route) or 2 (invalid input).
 7. **Synthetic data must stay labelled as synthetic.** No real-world
@@ -81,9 +85,20 @@ python -m app.cli.main fleet-demo --pods 100 --passengers 1000
    `edge.congestion_multiplier`. Edge costs are sampled when a pod **enters** an
    edge and are fixed for that traversal — both directions of that rule are
    pinned by tests, so do not "improve" it without updating them.
-10. **No swarm concepts in M3.** `PodStatus` has exactly five members
-   (idle, assigned, traveling, arrived, charging) and a test asserts that set.
-   Grouping, platooning and magnetic linking belong to M4.
+10. **`PodStatus` still has exactly five members** (idle, assigned, traveling,
+   arrived, charging) and a test asserts that set. M4 deliberately added no pod
+   state: swarm membership lives in `app/swarm/`, which is why M1-M3 needed no
+   edit for it. Keep it that way unless there is a reason M4 did not have.
+11. **The swarm layer reaches down too, and no further.** `app/swarm/` uses M3's
+   `advance_pod`, M2's routes and M1's edge costs unchanged; it defines **no
+   third cost or congestion model**. Formation is rule-based — explicit numeric
+   thresholds, no AI/LLM, no scoring model, no randomness. Platooning must never
+   grant a distance, time or energy discount: the coordination benefit is a
+   **road-space estimate** resting on `formation_occupancy_factor`, and no
+   aerodynamic, fuel or emissions saving may be claimed anywhere.
+12. **Rebalancing stays a hook.** `app/swarm/rebalancing.py` plans and returns
+   `RepositionRequest`s; nothing in M4 executes them, and `plan()` must stay
+   read-only. Adaptive rebalancing is M5.
 
 ## The M2 demand layer
 
@@ -122,11 +137,42 @@ before changing anything: a pod is only eligible for trips starting at the node
 it already occupies (**no repositioning**), and `max_trip_wait_min` is what makes
 a run terminate instead of waiting forever.
 
-## When starting M4
+## The M4 swarm layer
 
-Swarm formation consumes pods and their routes without modifying `app/fleet/`,
-the same way the fleet consumes M2. Put it in a new package above the fleet with
-its own tests. Grouping will need new pod states; add them to
-`ALLOWED_TRANSITIONS` deliberately and update the test that pins the current set.
-The pipeline is `demand → trips → routing → pod grouping → swarm formation`; M3
-ends at independent pod movement.
+`app/swarm/` sits on top of `app/fleet/` and is organised as:
+
+| Module | Holds |
+|---|---|
+| `config.py` | every threshold: the five compatibility rules, the two timing windows, `formation_occupancy_factor` |
+| `models.py` | `SharedCorridor`, `Swarm`, `SwarmStatus`, `ALLOWED_SWARM_TRANSITIONS`, `SwarmSnapshot` |
+| `compatibility.py` | `shared_edge_prefix`, `build_corridor`, `check_group` — the single implementation of the rules |
+| `formation.py` | `plan_formation` (pure planning), `build_swarms`, `swarm_id_for` |
+| `movement.py` | `advance_swarm` — lockstep platoon movement over M3's `advance_pod` |
+| `simulation.py` | `SwarmSimulation`, a `FleetSimulation` subclass overriding two steps |
+| `metrics.py` | `SwarmMetrics`, `compute_swarm_metrics`, `compare_modes` |
+| `rebalancing.py` | `RepositionRequest`, `FleetRebalancer`, `SurplusDeficitRebalancer` — hook only |
+
+`SwarmSimulation` extends `FleetSimulation` and overrides exactly two steps —
+`_depart_assigned_pods` (splitting + formation + the formation delay) and
+`_advance_travelling_pods` (platoon movement) — so M3's charging, assignment,
+records, timeout and battery model are inherited untouched. `enable_swarms=False`
+reproduces M3 exactly, and a test pins that against `FleetSimulation` itself;
+keep it true, because the baseline comparison depends on it.
+
+Two contracts to know before changing anything: edge costs are sampled when a pod
+**enters** an edge (inherited from M3), and `advance_swarm` steps to edge
+boundaries so a formation stops exactly at its divergence node instead of
+overrunning it.
+
+The dominant limitation is still M3's: pods only platoon when already co-located,
+so on the seed-42 city just 28 swarms form, nearly all of size 2.
+`max_formation_delay_min` is the one threshold that moves that number much.
+
+## When starting M5
+
+Adaptive rebalancing is the obvious next step, and M4 already defines its
+interface: implement `FleetRebalancer.plan` properly and give something the right
+to *execute* the requests. That execution is new behaviour — a pod driving empty —
+so it needs its own state or trip representation, its own tests, and honest
+accounting for the empty kilometres it adds. Do not change `app/swarm/` to do it;
+build above it as every milestone so far has.

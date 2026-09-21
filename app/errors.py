@@ -94,3 +94,23 @@ class DuplicatePodError(FleetError):
 
 class AssignmentError(FleetError):
     """A trip cannot be assigned to the requested pod."""
+
+
+class SwarmError(SwarmNetworkError):
+    """Base class for swarm/platoon (M4) errors."""
+
+
+class SwarmConfigError(SwarmError, ValueError):
+    """A swarm configuration or compatibility threshold is malformed."""
+
+
+class SwarmStateError(SwarmError):
+    """An illegal swarm state transition, or an operation invalid for that state."""
+
+
+class SwarmNotFoundError(SwarmError):
+    """A referenced swarm id does not exist."""
+
+
+class IncompatibleSwarmError(SwarmError):
+    """Pods were asked to form a swarm that the compatibility rules reject."""
