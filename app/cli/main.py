@@ -1,4 +1,4 @@
-"""CLI for Milestones 1 and 2.
+"""CLI for Milestones 1, 2, 3 and 4.
 
 Examples:
     python -m app.cli.main route --from "North Station" --to "Airport"
@@ -9,6 +9,8 @@ Examples:
     python -m app.cli.main export-scenario --seed 42 --output scenarios/baseline.json
     python -m app.cli.main demand-demo --profile baseline --passengers 1000
     python -m app.cli.main demand-demo --profile peak_hour --passengers 2000 --no-routing
+    python -m app.cli.main fleet-demo --pods 100 --passengers 1000
+    python -m app.cli.main swarm-demo --pods 100 --passengers 1000
 
 Results go to stdout; logs and errors go to stderr. Exit codes: 0 ok,
 1 no route, 2 invalid input / scenario error.
@@ -20,6 +22,7 @@ import argparse
 import logging
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -33,11 +36,24 @@ from app.demand import (
     route_trips,
 )
 from app.errors import ModelValidationError, NoRouteError, SwarmNetworkError
+from app.fleet import (
+    DEFAULT_FLEET_CONFIG,
+    DEFAULT_FLEET_SEED,
+    FleetSimulation,
+    compute_fleet_metrics,
+    generate_fleet,
+)
 from app.models.route import Route
 from app.network.builder import LoadedScenario, dump_scenario, load_scenario
 from app.network.synthetic_city import build_synthetic_city, generate_synthetic_city_dict
 from app.routing import ALGORITHM_LABELS, find_route
 from app.simulation.state import SimulationState
+from app.swarm import (
+    DEFAULT_SWARM_CONFIG,
+    SurplusDeficitRebalancer,
+    SwarmSimulation,
+    compute_swarm_metrics,
+)
 
 BANNER = "MODULAR SWARM NETWORK\n====================="
 
@@ -214,6 +230,195 @@ def cmd_demand_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fleet_demo(args: argparse.Namespace) -> int:
+    """Run the pod fleet against generated demand (M3).
+
+    Pods are independent vehicles here: swarm/platoon formation is deferred to M4.
+    """
+    scenario = _load(args)
+    state = SimulationState.from_scenario(scenario)
+    graph = state.graph
+    profile = resolve_demand_profile(args.profile)
+    config = DEFAULT_FLEET_CONFIG
+    if args.capacity is not None:
+        config = replace(config, default_pod_capacity=args.capacity)
+    if args.tick_minutes is not None:
+        config = replace(config, tick_minutes=args.tick_minutes)
+
+    demand = generate_demand(graph, seed=args.demand_seed, passenger_count=args.passengers,
+                             profile=profile)
+    fleet = generate_fleet(graph, fleet_size=args.pods, seed=args.fleet_seed,
+                           config=config, profile=profile)
+    simulation = FleetSimulation(graph, fleet, demand.trips, config,
+                                 algorithm=args.algorithm)
+    run = simulation.run(max_ticks=args.max_ticks)
+    metrics = compute_fleet_metrics(fleet, simulation.records(), simulation.time_min)
+
+    print(_header(scenario, state))
+    print("Pod fleet [SYNTHETIC — approximated energy model, not physics]")
+    print("-------------------------------------------------------------")
+    print("Pods are independent in M3; swarm/platoon formation is deferred to M4.")
+    print(f"\nFleet: {metrics.total_pods} pods (seed {args.fleet_seed})")
+    print(f"Capacity: {config.default_pod_capacity} seats per pod "
+          f"({metrics.total_capacity} seats total)")
+    print(f"Demand profile: {profile.profile_id} (seed {args.demand_seed})")
+    print(f"Trips: {metrics.total_trips}")
+    print(f"Simulated: {run.ticks} ticks of {config.tick_minutes:g} min "
+          f"-> minute {run.end_time_min:g} ({run.stopped_because})")
+
+    print("\nTrips")
+    print(f"  Assigned and completed: {metrics.completed_trips}"
+          f"  ({'n/a' if metrics.completion_rate is None else format(metrics.completion_rate, '.1%')})")
+    print(f"  Unassigned (no pod at origin in time): {metrics.unassigned_trips}")
+    print(f"  Unroutable (no path exists): {metrics.unroutable_trips}")
+    print(f"  Average wait before pickup: {metrics.average_trip_wait_time_min} min")
+    print(f"  Average completion time: {metrics.average_trip_completion_time_min} min")
+
+    print("\nFleet activity")
+    print(f"  Passengers carried: {metrics.total_passengers_carried}")
+    print(f"  Average occupancy: {metrics.average_passenger_occupancy} of "
+          f"{config.default_pod_capacity} seats"
+          f"  ({'n/a' if metrics.average_occupancy_rate is None else format(metrics.average_occupancy_rate, '.1%')})")
+    print(f"  Average pod utilization (driving time): "
+          f"{'n/a' if metrics.average_pod_utilization is None else format(metrics.average_pod_utilization, '.1%')}")
+    print(f"  Distance travelled: {metrics.total_distance_km} km")
+    print(f"  Driving time: {metrics.total_travel_time_min} min")
+
+    print("\nEnergy (approximation)")
+    print(f"  Consumed: {metrics.total_energy_kwh} kWh")
+    print(f"  Average: {metrics.average_energy_per_km} kWh/km")
+    batteries = [pod.battery_percent for pod in fleet.pods()]
+    if batteries:
+        print(f"  Battery: min {min(batteries):.1f}%  mean {sum(batteries) / len(batteries):.1f}%")
+
+    print("\nFinal fleet state")
+    for status, count in sorted(fleet.count_by_status().items()):
+        print(f"  {status:<10} {count}")
+
+    print(f"\nFleet fingerprint: {simulation.snapshot().fingerprint()}")
+    return 0
+
+
+def cmd_swarm_demo(args: argparse.Namespace) -> int:
+    """Form platoons from compatible pod journeys and compare against M3 (M4).
+
+    Formation is deterministic and rule-based — no AI/LLM is involved. A swarm is
+    a coordination layer over individual pods, not a single vehicle.
+    """
+    profile = resolve_demand_profile(args.profile)
+    fleet_config = DEFAULT_FLEET_CONFIG
+    if args.capacity is not None:
+        fleet_config = replace(fleet_config, default_pod_capacity=args.capacity)
+    swarm_config = DEFAULT_SWARM_CONFIG
+    if args.formation_delay is not None:
+        swarm_config = replace(swarm_config, max_formation_delay_min=args.formation_delay)
+    if args.max_swarm_size is not None:
+        swarm_config = replace(swarm_config, max_swarm_size=args.max_swarm_size)
+
+    # Both runs must start from an untouched network and fleet, so build each
+    # from scratch: only the swarm switch differs.
+    def fresh():
+        scenario = _load(args)
+        state = SimulationState.from_scenario(scenario)
+        demand = generate_demand(state.graph, seed=args.demand_seed,
+                                 passenger_count=args.passengers, profile=profile)
+        fleet = generate_fleet(state.graph, fleet_size=args.pods, seed=args.fleet_seed,
+                               config=fleet_config, profile=profile)
+        return scenario, state, demand, fleet
+
+    scenario, state, demand, _ = fresh()
+    runs = {}
+    for enabled in (False, True):
+        _, run_state, run_demand, run_fleet = fresh()
+        simulation = SwarmSimulation(run_state.graph, run_fleet, run_demand.trips, fleet_config,
+                                     swarm_config=swarm_config, enable_swarms=enabled,
+                                     algorithm=args.algorithm)
+        report = simulation.run(max_ticks=args.max_ticks)
+        runs[enabled] = (simulation, run_fleet, report,
+                         compute_fleet_metrics(run_fleet, simulation.records(), simulation.time_min),
+                         compute_swarm_metrics(simulation, swarm_config))
+
+    swarm_sim, swarm_fleet, swarm_report, swarm_fleet_m, swarm_m = runs[True]
+    base_sim, base_fleet, base_report, base_fleet_m, base_m = runs[False]
+
+    print(_header(scenario, state))
+    print("Swarm formation and platooning [SYNTHETIC — deterministic, rule-based]")
+    print("---------------------------------------------------------------------")
+    print("A swarm is a coordination layer over individual pods, not one vehicle.")
+    print("Pods keep their own passengers, battery and route. No AI/LLM is involved.")
+
+    print(f"\nFleet: {swarm_fleet_m.total_pods} pods x {fleet_config.default_pod_capacity} seats"
+          f"   Demand: {profile.profile_id}, {swarm_fleet_m.total_trips} trips")
+    print(f"Active trips served: {swarm_fleet_m.completed_trips}")
+    print(f"Thresholds: >= {swarm_config.min_shared_edges} shared edges, "
+          f">= {swarm_config.min_shared_distance_km:g} km, "
+          f">= {swarm_config.min_shared_route_fraction:.0%} of each journey, "
+          f"<= {swarm_config.max_swarm_size} pods, "
+          f"wait <= {swarm_config.max_formation_delay_min:g} min")
+
+    print("\nSwarms")
+    print(f"  Swarms formed: {swarm_m.swarm_count}")
+    print(f"  Splits at divergence: {swarm_m.split_count}")
+    print(f"  Average size: {swarm_m.average_swarm_size} pods   Largest: {swarm_m.max_swarm_size} pods")
+    print(f"  Pods that platooned at least once: {swarm_m.distinct_pods_ever_in_a_swarm}"
+          f" of {swarm_m.total_pods} ({swarm_m.swarm_participation_percent}%)")
+    print(f"  Average shared corridor: {swarm_m.average_shared_corridor_distance_km} km "
+          f"over {swarm_m.average_shared_corridor_edges} edges")
+    print(f"  Total shared corridor: {swarm_m.total_shared_corridor_distance_km} km")
+    print(f"  Average time in formation: {swarm_m.average_swarm_duration_min} min")
+
+    if swarm_sim.swarms():
+        print(f"\nExample swarms (of {swarm_m.swarm_count})")
+        for swarm in swarm_sim.swarms()[:args.examples]:
+            names = " ".join(swarm.pod_ids)
+            print(f"  {swarm.swarm_id}  {names}  (leader {swarm.leader_pod_id})")
+            print(f"    corridor {' -> '.join(swarm.corridor.edge_ids)}"
+                  f"  {swarm.corridor.distance_km:.2f} km")
+            print(f"    from {state.graph.get_node(swarm.corridor.origin_node_id).name}"
+                  f" to {state.graph.get_node(swarm.corridor.divergence_node_id).name}"
+                  f"  then each pod continues alone")
+
+    print("\nIndependent (M3) vs swarm (M4) — same network, demand, fleet, seed and horizon")
+    print(f"  {'metric':<34}{'independent':>13}{'swarm':>13}")
+    rows = [
+        ("pods that platooned", base_m.distinct_pods_ever_in_a_swarm, swarm_m.distinct_pods_ever_in_a_swarm),
+        ("swarms formed", base_m.swarm_count, swarm_m.swarm_count),
+        ("trips completed", base_fleet_m.completed_trips, swarm_fleet_m.completed_trips),
+        ("pod distance driven (km)", base_fleet_m.total_distance_km, swarm_fleet_m.total_distance_km),
+        ("energy used (kWh)", base_fleet_m.total_energy_kwh, swarm_fleet_m.total_energy_kwh),
+        ("road occupancy (km, est.)", base_m.road_occupancy_km, swarm_m.road_occupancy_km),
+        ("shared corridor (km)", base_m.total_shared_corridor_distance_km,
+         swarm_m.total_shared_corridor_distance_km),
+        ("avg wait before pickup (min)", base_fleet_m.average_trip_wait_time_min,
+         swarm_fleet_m.average_trip_wait_time_min),
+        ("avg completion time (min)", base_fleet_m.average_trip_completion_time_min,
+         swarm_fleet_m.average_trip_completion_time_min),
+    ]
+    for label, left, right in rows:
+        print(f"  {label:<34}{left!s:>13}{right!s:>13}")
+
+    print(f"\n  Estimated road space freed by coordination: "
+          f"{swarm_m.coordination_benefit_km} km "
+          f"({swarm_m.road_occupancy_saving_percent}% of pod-km)")
+    print(f"  Assumption: a following pod in formation needs "
+          f"{swarm_config.formation_occupancy_factor:.0%} of an independent pod's road space.")
+    print("  This is a ROAD-SPACE estimate only. Pod distance, travel time and energy are")
+    print("  unchanged by platooning above — no fuel, energy or emissions saving is claimed.")
+
+    requests = SurplusDeficitRebalancer(max_requests=args.rebalance_preview).plan(
+        swarm_fleet, swarm_sim.records(), swarm_sim.graph)
+    print(f"\nRebalancing hook: {len(requests)} reposition request(s) planned, none executed.")
+    for request in requests:
+        print(f"  {request.request_id}  {request.pod_id}  "
+              f"{state.graph.get_node(request.from_node_id).name} -> "
+              f"{state.graph.get_node(request.to_node_id).name}  (unserved: {request.priority})")
+    print("  M4 exposes the interface only; adaptive rebalancing belongs to M5.")
+
+    print(f"\nSwarm fingerprint: {swarm_sim.swarm_snapshot().fingerprint()}")
+    print(f"Fleet fingerprint: {swarm_sim.snapshot().fingerprint()}")
+    return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     text = dump_scenario(generate_synthetic_city_dict(args.seed))
     if args.output == "-":
@@ -225,7 +430,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="app.cli.main", description="Modular Swarm Network — M1 + M2 CLI")
+    parser = argparse.ArgumentParser(prog="app.cli.main", description="Modular Swarm Network — M1 + M2 + M3 + M4 CLI")
     parser.add_argument("--log-level", default="WARNING",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="log level (logs go to stderr)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -271,6 +476,39 @@ def build_parser() -> argparse.ArgumentParser:
     demand.add_argument("--top", type=int, default=5, help="how many OD pairs to list")
     add_source(demand)
     demand.set_defaults(func=cmd_demand_demo)
+
+    fleet = sub.add_parser("fleet-demo", help="run the pod fleet against generated demand")
+    fleet.add_argument("--pods", type=int, default=100, help="fleet size")
+    fleet.add_argument("--capacity", type=int, default=None, help="seats per pod")
+    fleet.add_argument("--passengers", type=int, default=1000, help="synthetic passengers to generate")
+    fleet.add_argument("--profile", default="baseline",
+                       help="demand profile name (baseline, peak_hour) or a demand JSON path")
+    fleet.add_argument("--fleet-seed", type=int, default=DEFAULT_FLEET_SEED)
+    fleet.add_argument("--demand-seed", type=int, default=DEFAULT_DEMAND_SEED)
+    fleet.add_argument("--tick-minutes", type=float, default=None, help="simulation tick length")
+    fleet.add_argument("--max-ticks", type=int, default=100_000)
+    fleet.add_argument("--algorithm", choices=["astar", "dijkstra"], default="astar")
+    add_source(fleet)
+    fleet.set_defaults(func=cmd_fleet_demo)
+
+    swarm = sub.add_parser("swarm-demo", help="form platoons and compare with independent pods")
+    swarm.add_argument("--pods", type=int, default=100, help="fleet size")
+    swarm.add_argument("--capacity", type=int, default=None, help="seats per pod")
+    swarm.add_argument("--passengers", type=int, default=1000)
+    swarm.add_argument("--profile", default="baseline",
+                       help="demand profile name (baseline, peak_hour) or a demand JSON path")
+    swarm.add_argument("--fleet-seed", type=int, default=DEFAULT_FLEET_SEED)
+    swarm.add_argument("--demand-seed", type=int, default=DEFAULT_DEMAND_SEED)
+    swarm.add_argument("--formation-delay", type=float, default=None,
+                       help="minutes a pod waits at its origin for compatible partners")
+    swarm.add_argument("--max-swarm-size", type=int, default=None)
+    swarm.add_argument("--examples", type=int, default=3, help="how many example swarms to print")
+    swarm.add_argument("--rebalance-preview", type=int, default=3,
+                       help="how many planned reposition requests to show")
+    swarm.add_argument("--max-ticks", type=int, default=100_000)
+    swarm.add_argument("--algorithm", choices=["astar", "dijkstra"], default="astar")
+    add_source(swarm)
+    swarm.set_defaults(func=cmd_swarm_demo)
 
     export = sub.add_parser("export-scenario", help="write the synthetic city as scenario JSON")
     export.add_argument("--seed", type=int, default=DEFAULT_SEED)

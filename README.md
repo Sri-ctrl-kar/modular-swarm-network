@@ -1,12 +1,13 @@
-# Modular Swarm Network — Milestones 1 + 2
+# Modular Swarm Network — Milestones 1 + 2 + 3 + 4
 
-**Deterministic city + network foundation, and a deterministic passenger-demand model.**
+**Deterministic city + network foundation, passenger demand, an autonomous electric
+pod fleet, and rule-based swarm formation and platooning.**
 
 > ⚠️ **All data in this milestone is SYNTHETIC.** The city, coordinates, distances,
 > capacities and traffic counts are invented. Nothing here claims real-world
 > transportation performance.
 
-## 1. What M1 and M2 do
+## 1. What M1-M4 do
 
 M1 answers one question reliably and reproducibly:
 
@@ -16,16 +17,24 @@ M2 adds a second:
 
 > *Given a city network, where are people trying to travel, when are they travelling, and how much demand exists between origins and destinations?*
 
+M3 adds a third:
+
+> *Given that demand, which pods serve which trips, how do they move through the network, and what does that cost in time and energy?*
+
+M4 adds a fourth:
+
+> *Which of those pods have compatible enough journeys to travel as a coordinated platoon, where do they split, and what does coordinating actually change?*
+
 It provides validated node/edge models, a directed weighted graph with dynamic
 (traffic-dependent) costs, a transparent congestion model, Dijkstra and A*
 routing with a proven-admissible heuristic, a seeded synthetic city, a
 human-readable scenario file, a minimal simulation state, and a CLI.
 
-## 2. What M1 + M2 deliberately do NOT do
+## 2. What M1-M4 deliberately do NOT do
 
-No pods, platooning or splitting (M3+), no swarm
-controller, no Gemini / LLM / agents, no demand prediction, no dashboard or
-animation, no impact comparison, no route caching, no real map data.
+No magnetic linking, no adaptive fleet rebalancing (M4 ships the interface only —
+see §10), no Gemini / LLM / agents, no demand prediction, no dashboard or
+animation, no route caching, no real map data.
 The runtime uses **only the Python standard library** and works fully offline.
 
 ## 3. Architecture
@@ -36,8 +45,22 @@ The runtime uses **only the Python standard library** and works fully offline.
                  └──────────────┬─────────────┘
                                 │
           ┌─────────────────────▼─────────────────────┐
+          │ app/swarm/  (M4)                          │  compatibility, formation,
+          │  config.py  models.py  compatibility.py   │  platoon movement, splitting
+          │  formation.py  movement.py  simulation.py │  rule-based, no AI/LLM
+          │  metrics.py  rebalancing.py (hook only)   │
+          └─────────────────────┬─────────────────────┘
+                                │
+          ┌─────────────────────▼─────────────────────┐
+          │ app/fleet/  (M3)                          │  pods, assignment, movement
+          │  config.py  models.py  pod_fleet.py       │  discrete ticks, battery model
+          │  generator.py  assignment.py  movement.py │  independent pods, no swarms
+          │  simulation.py  metrics.py                │
+          └─────────────────────┬─────────────────────┘
+                                │
+          ┌─────────────────────▼─────────────────────┐
           │ app/demand/  (M2)                         │  passengers, trips, OD matrix
-          │  config.py  generator.py  models.py       │  seeded RNG, no vehicles yet
+          │  config.py  generator.py  models.py       │  seeded RNG, no vehicles
           │  trip_routing.py  metrics.py  profile_io  │
           └─────────────────────┬─────────────────────┘
                                 │
@@ -65,9 +88,11 @@ The runtime uses **only the Python standard library** and works fully offline.
    scenarios/demand_*.json       ──(profile_io)──▶  DemandProfile
 ```
 
-Dependencies point downward only: `models ← network ← routing ← simulation ← demand ← cli`.
-M2's demand layer consumes the M1 foundation and is imported by none of it (a test
-enforces this). Future layers (pods, swarm controller) sit above demand.
+Dependencies point downward only:
+`models ← network ← routing ← simulation ← demand ← fleet ← swarm ← cli`.
+Each layer consumes the ones below and is imported by none of them; tests walk the
+lower packages to enforce that none of `app.demand`, `app.fleet` or `app.swarm`
+is imported downward.
 
 ## 4. Data models
 
@@ -77,6 +102,12 @@ enforces this). Future layers (pods, swarm controller) sit above demand.
 | `Edge` | `edge_id`, `source`, `destination`, `distance_km`, `base_travel_time_min`, `capacity_vehicles_per_hour`, `current_vehicle_count`, `road_type` ∈ {local, arterial, trunk} | positive finite distance/time, integer capacity > 0, integer count ≥ 0, no self-loops |
 | `Route` (frozen) | `origin`, `destination`, `node_ids`, `edge_ids`, `total_distance_km`, `total_travel_time_min`, `total_cost`, `cost_metric`, `nodes_visited`, `algorithm` | path consistency, non-negative totals |
 | `NetworkSnapshot` (frozen) | `time_min`, `vehicle_counts` | stable SHA-256 `fingerprint()` |
+| `Pod` (M3) | `pod_id`, `capacity`, `current_node_id`, `status`, `battery_percent`, `assigned_trip_id`, route + progress, `current_edge_id` | capacity ≥ 1, battery ∈ [0, 100], occupancy ≤ capacity, only legal state transitions |
+| `TripRecord` (M3) | `trip_id`, `party_size`, endpoints, `status`, `pod_id`, timings, measured distance/energy | party ≥ 1, valid status, never deleted |
+| `FleetSnapshot` (M3, frozen) | `time_min`, per-pod state, trip status counts | stable SHA-256 `fingerprint()`, battery rounded |
+| `SharedCorridor` (M4, frozen) | `edge_ids`, `origin_node_id`, `divergence_node_id`, `distance_km`, `travel_time_min` | non-empty, no repeated edge, non-negative totals |
+| `Swarm` (M4) | `swarm_id`, sorted `pod_ids`, `leader_pod_id`, `corridor`, `status`, progress, `formation_time_min` | **≥ 2 pods**, leader is a member, progress never exceeds the corridor or goes backwards |
+| `SwarmSnapshot` (M4, frozen) | `time_min`, per-swarm state, status counts, formation/split counts | stable SHA-256 `fingerprint()`, distance rounded |
 
 Only `current_vehicle_count` is mutable, via `Edge.set_vehicle_count()`.
 The graph additionally enforces two **geometry rules** on every edge:
@@ -300,7 +331,341 @@ Same seed, passenger count, profile and network ⇒ byte-identical passengers,
 trips, OD matrix, metrics and `DemandSnapshot.fingerprint()`, in one process and
 across separate processes. Verified for both profiles.
 
-## 9. How to run
+## 9. Pod fleet simulation (M3)
+
+> ⚠️ **All fleet data is SYNTHETIC.** The pods, their capacity, the energy model
+> and the charging behaviour are invented for prototyping. The battery figure is
+> an explicit simulation approximation, **not** a physically calibrated vehicle,
+> battery or charging model.
+
+> **M3 models pods independently. Swarm/platoon formation is intentionally
+> deferred to M4.** There is no grouping, no platooning and no magnetic linking
+> here, and no pod status describes one — `PodStatus` has exactly five members and
+> a test asserts that.
+
+M3 is the physical fleet layer. The pipeline is now end to end:
+
+```
+demand generator → TripRequests → router → pod assignment → pod movement → trip completion
+```
+
+### What a pod represents
+
+One autonomous electric passenger pod: a single vehicle with a stable id, a seat
+count, a position on the network, a battery and at most one trip. Units are
+explicit — `battery_percent` is 0–100, distances km, times minutes, energy kWh.
+
+`Pod` follows M1's `Edge` convention: a frozen dataclass whose identity
+(`pod_id`, `capacity`) can never change, while dynamic state moves only through
+validated methods. A `Pod` validates the *shape* of a node id; `PodFleet` holds
+the graph and so is the layer that checks the node actually exists.
+
+**State machine** (any other transition raises `PodStateError`):
+
+```
+IDLE ──assign──▶ ASSIGNED ──start_travel──▶ TRAVELING ──arrive──▶ ARRIVED
+ │  ▲                │                                               │
+ │  └────release─────┘                                               │
+ │  ▲────────────────────────release──────────────────────────────────┘
+ │
+ └──begin_charging──▶ CHARGING ──finish_charging──▶ IDLE
+```
+
+### Fleet initialisation
+
+`generate_fleet(graph, fleet_size=…, seed=…)` places pods on nodes with weights
+from `FleetConfig.depot_role_weights`, resolved through **M2's `PlaceRole`
+classification** — the fleet reuses that role map rather than inventing a second
+one. Hubs are weighted highest (4.0), then residential (3.0), employment and
+mixed (2.0), plain junctions last (1.0), so pods start where travel starts.
+
+Determinism works as in M1's city and M2's demand: a local `random.Random(seed)`
+(the global `random` module is never touched), one draw per pod in index order,
+over a node list sorted by node id. Ids are positional — `POD00000`, `POD00001`,
+… — so a larger fleet keeps a smaller one as a prefix. **This deployment is
+invented and does not represent any real fleet positioning.**
+
+### Pod capacity
+
+Capacity defaults to 4 seats and is configurable per fleet or per pod. A pod
+tracks `capacity`, `occupied_seats` and `available_seats`; a trip whose party
+exceeds the available seats is refused. Capacity here is strictly *individual* —
+there is no combined swarm capacity, because there are no swarms.
+
+### Trip assignment
+
+`assign_trip` decides *which* pod takes a trip, asks M2's `route_trip` for the
+path (no routing logic is reimplemented), and hands the result to the pod. A pod
+is eligible when **all** of these hold:
+
+1. it is `IDLE`;
+2. it is standing at the trip's origin node;
+3. its available seats cover the party size;
+4. its battery covers the route's estimated energy plus the configured reserve.
+
+Among eligible pods the **lowest `pod_id`** wins, which makes assignment
+reproducible and independent of dict ordering. Assignment is deliberately local,
+not globally optimised.
+
+Condition 2 means **M3 does no repositioning**: a pod never drives empty to a
+pickup, so a trip with no co-located pod is reported as unassigned rather than
+quietly served. See *Known limitations* — this, not fleet size, is what bounds
+the completion rate.
+
+### Movement
+
+A pod progresses edge by edge along its route, and `advance_pod` may finish
+several edges inside one tick. Event times are exact rather than tick-quantised.
+
+Movement reads its costs from M1 — `edge.current_travel_time_min` and
+`edge.congestion_multiplier` — so **there is no second cost model and no second
+congestion model.** When a cost is sampled matters:
+
+* travel time, distance and energy are sampled when the pod **enters** an edge,
+  and hold for that traversal;
+* so congestion on an edge the pod has **not yet reached** does change its trip;
+* congestion on the edge it is **already driving** does not retroactively change
+  that traversal, because the pod is already on the road.
+
+That is a deliberate, documented choice: it keeps a traversal's cost
+well-defined without continuously re-integrating traffic. Both directions are
+pinned by tests.
+
+### Battery approximation
+
+```
+energy_kwh           = base_energy_kwh_per_km × distance_km × congestion_multiplier
+battery_drop_percent = energy_kwh / battery_capacity_kwh × 100
+```
+
+`congestion_multiplier` is the edge's own multiplier from M1, so stop-start
+traffic costs proportionally more energy — directionally right, numerically
+invented. At the defaults (0.18 kWh/km, 40 kWh) one km costs 0.45 % of a full
+battery.
+
+The battery can never go negative: `discharge()` clamps at 0 and returns what it
+actually removed, `charge()` clamps at 100. A pod below `low_battery_percent`
+(20 %) is not eligible for assignment and enters `CHARGING` when idle, returning
+to service at `target_charge_percent` (90 %) at `charge_percent_per_min`.
+
+**Ignored on purpose:** gradients, mass, payload, regenerative braking,
+temperature, battery ageing, non-linear charging curves, auxiliary loads, and the
+energy cost of driving empty. No drafting or platooning benefit exists, because
+pods are independent in M3.
+
+### Simulation ticks
+
+A discrete simulation, not a live control system: nothing sleeps and nothing
+polls a wall clock. There is **no RNG in the tick loop at all** — fleet
+initialisation is M3's only seeded step. Each tick covers `[t, t + tick_minutes)`
+(default 1 minute) in a fixed order:
+
+1. finish charging (battery at or above target → `IDLE`)
+2. release `ARRIVED` pods → `IDLE`
+3. send flat `IDLE` pods to `CHARGING`
+4. charge `CHARGING` pods
+5. depart pods assigned on an **earlier** tick
+6. advance `TRAVELING` pods, completing edges and arrivals
+7. assign `PENDING` trips whose `request_time_min` has arrived
+8. give up on trips waiting past `max_trip_wait_min`
+9. advance the clock
+
+Steps 5 and 7 are in that order deliberately: a pod assigned during a tick
+departs on the *next* one, so `ASSIGNED` is a real, observable boarding state
+rather than an instant no snapshot could catch. Trips are processed in `trip_id`
+order and pods in `pod_id` order.
+
+Step 8 exists so a run terminates: without a dispatch timeout, a trip whose
+origin never sees an idle pod would wait forever.
+
+### Trip records
+
+A `TripRecord` per trip, **never deleted**, moving through
+`PENDING → ASSIGNED → IN_PROGRESS → COMPLETED`, or to `FAILED`. The two kinds of
+failure stay distinguishable by reason prefix: `unroutable:` (no path exists at
+all) and `no pod available within …` (the dispatch timeout). Completed records
+carry measured figures — the energy the pod really consumed and the minutes it
+really drove — not route estimates.
+
+### Fleet metrics
+
+`compute_fleet_metrics()` reports pod counts per status; completed, pending,
+failed, unroutable, timed-out and unassigned trips; average pod utilisation
+(share of the window each pod spent driving); average passenger occupancy and
+occupancy rate; total distance, driving time and energy; average energy per km;
+and average trip completion and wait times. Figures are rounded modestly, and an
+average over zero samples is `None` rather than a misleading `0.0`.
+
+### Deterministic guarantees
+
+Same network, demand, fleet size, seed and configuration ⇒ identical fleet
+initialisation, assignments, pod trajectories, trip completions, battery levels,
+metrics, final fleet state and `FleetSnapshot.fingerprint()` — in one process,
+across repeated runs, tick report by tick report, and across separate Python
+processes. All four are covered by tests.
+
+## 10. Swarm formation and platooning (M4)
+
+> **M4 uses deterministic rule-based swarm formation. No AI/LLM is involved.**
+> Every decision is an explicit numeric comparison against a threshold in
+> `app/swarm/config.py`. There is no learned model, no scoring heuristic and no
+> randomness anywhere in the swarm layer.
+
+> **A swarm is a coordination layer over individual autonomous pods, not a
+> fictional single vehicle.** Each pod keeps its own id, battery, passengers,
+> route and odometer. Four pods in a platoon are four pods.
+
+```
+individual pods → compatible routes → swarm formation → platoon travel
+                → route divergence → swarm split → individual pods
+```
+
+### What a swarm is
+
+A `Swarm` records that two or more pods traverse one **shared corridor**
+together: their ids (always sorted), a leader, the corridor, when it formed, and
+how far along it is. It moves `FORMING → ACTIVE → SPLITTING → COMPLETED`, and a
+swarm needs **at least 2 pods** — one pod travelling alone is not a swarm.
+
+M4 added **no pod states**. `PodStatus` still has M3's five members and
+`app/fleet/` needed no edit at all: swarm membership lives in the swarm layer,
+which is what keeps the "coordination layer, not a vehicle" framing honest in the
+code as well as the prose.
+
+### The compatibility rules
+
+All of these must hold, and each is a threshold comparison:
+
+| # | Rule | Threshold |
+|---|---|---|
+| 1 | **Co-location** — candidates stand at the same node, ready for the same next edge | — (no teleporting into formation) |
+| 2 | **Corridor length** — their routes' common prefix is long enough | `min_shared_edges` = 2, `min_shared_distance_km` = 3.0 |
+| 3 | **Bounded divergence** — the corridor is a real share of *every* member's remaining journey | `min_shared_route_fraction` = 0.4 |
+| 4 | **Size** | 2 ≤ n ≤ `max_swarm_size` = 4 |
+| 5 | **State** — each holds a trip and a route and is in no other swarm | — |
+
+Plus two timing thresholds:
+
+* `max_formation_delay_min` (5.0) — how long an assigned pod waits at its origin
+  for partners before departing alone. **This is the only behavioural difference
+  from M3**, and by far the most influential threshold: on the seed-42 city with
+  100 pods and 1,000 trips, raising it from 3 → 5 → 10 → 15 minutes takes the
+  swarm count from 15 → 28 → 36 → 47, while the other thresholds barely move it.
+  Longer waits platoon more pods but delay arrivals, and past ~15 minutes
+  completions start to fall.
+* `min_formation_stability_min` (2.0) — a swarm only forms if its corridor is
+  worth at least this much travel time. **This is what prevents oscillation:** a
+  group that would disband almost immediately is never formed in the first place.
+
+### Common corridors
+
+The corridor is the **common prefix** of the members' remaining routes — not any
+shared edge later on. Given
+
+```
+Pod A:  A → B → C → D → E
+Pod B:  A → B → C → D → F
+```
+
+the corridor is `A → B → C → D`, the divergence node is `D`, and each pod's
+remaining individual route after `D` is its own. A swarm knows its corridor's
+edge ids, distance, travel time and divergence node explicitly.
+
+### Platoon movement
+
+`advance_swarm` moves the members **together**, stepping to edge boundaries so
+they stay on the same edge with the same elapsed time and stop *exactly* at the
+divergence node rather than overrunning it. A test asserts the lockstep property
+mid-corridor, and that at the divergence node the pods share a node but sit on
+different onward edges with zero elapsed time.
+
+Every metre still goes through M3's `advance_pod`, which reads M1's
+`edge.current_travel_time_min`. **There is no second cost model and no second
+congestion model.**
+
+### Splitting and rejoining
+
+When a corridor is exhausted the swarm goes `SPLITTING`, and the members standing
+at the divergence node are offered to the formation planner again. A subgroup that
+still shares a corridor continues as a **new** swarm; everyone else becomes
+independent. Worked example from the fixture used in the tests:
+
+```
+SW00001  POD00000 POD00001 POD00002 POD00003   corridor C1 → C2 → C3  (12.0 km)
+                                               divergence H3
+   ├── SW00002  POD00000 POD00002 POD00003      corridor HE → ME  (8.0 km)  → E
+   └── POD00001 continues alone                                              → F
+```
+
+Rejoining is the same mechanism: a later valid corridor forms a new swarm. Because
+formation only happens at departure and at a divergence, and splitting only
+happens when a corridor genuinely ends, there is no per-tick churn — and the
+stability window blocks groups that would break up at once. A test asserts no
+swarm is ever formed or split twice.
+
+### Congestion changes compatibility
+
+```
+traffic → edge cost → route change → shared corridor change → compatibility change
+```
+
+A regression test pins this on a purpose-built fork. In free flow two pods share
+`C1 → C2 → C3` and platoon. Congesting `C3` reroutes the E-bound pod onto a
+bypass while the F-bound pod, which has no alternative, stays on the corridor:
+they now share nothing and no swarm forms. Same fleet, same trips, same
+thresholds — only the traffic differs. A second test covers the reverse, where
+congestion reroutes both pods the same way and they platoon on the *new* corridor.
+
+### What coordinating actually changes — and what it does not
+
+**Platooning grants no discount on distance, travel time or energy.** A pod in a
+formation drives the same edges at the same M1 costs and pays the same M3 battery
+cost as it would alone — a test asserts a platooned pod and a solo pod covering
+the same corridor consume exactly the same.
+
+What coordination changes is modelled road **space**:
+
+| Metric | Meaning |
+|---|---|
+| `pod_distance_km` | km physically driven by all pods. **Platooning does not reduce this.** |
+| `shared_corridor_distance_km` | corridor km traversed under coordination, counted **once per swarm** |
+| `coordinated_pod_km` | pod-km driven in formation = corridor × members |
+| `road_occupancy_km` | `independent_pod_km + Σ corridor_km × (1 + (n−1) × factor)` |
+| `coordination_benefit_km` | `pod_distance_km − road_occupancy_km` — road space freed |
+
+Four pods over a 5 km corridor is **5 corridor-km and 20 pod-km**. The
+`formation_occupancy_factor` (0.4) is a **project assumption about headway** — a
+following pod needs 40 % of an independent pod's road space. It is **not** an
+aerodynamic, fuel, energy or emissions saving, and none is claimed anywhere.
+
+### Independent vs swarm: the controlled comparison
+
+`compare_modes()` runs the same scenario twice with only `enable_swarms` flipped —
+same network, demand, fleet, seed, thresholds and horizon, each run built from
+scratch so neither inherits the other's traffic or pod positions.
+`enable_swarms=False` reproduces M3 exactly, fingerprint for fingerprint (a test
+asserts that against `FleetSimulation` itself).
+
+Read the comparison carefully: fleet **totals** differ between modes, and not
+because platooning discounts anything. Waiting up to `max_formation_delay_min`
+shifts departures, so a slightly different set of trips gets served and distance
+and energy totals move with the served set. Waiting also costs riders time, so
+average wait and completion time **rise**. Both effects are reported rather than
+hidden.
+
+### Fleet rebalancing — hook only
+
+> **M4 exposes the interface required for future fleet rebalancing. Actual
+> adaptive rebalancing belongs to M5.**
+
+`app/swarm/rebalancing.py` defines `RepositionRequest` (a proposed empty move) and
+the `FleetRebalancer` protocol, plus `SurplusDeficitRebalancer` — a deliberately
+naive reference planner that pairs nodes holding idle pods against nodes where
+trips went unserved. `plan()` is **read-only**: it moves no pod, assigns no trip
+and changes no traffic, and nothing in M4 executes what it returns. A test asserts
+all of that.
+
+## 11. How to run
 
 Python 3.11+. No installation is needed for the runtime.
 
@@ -328,10 +693,37 @@ top OD pairs, demand per time bucket, a routing summary and the demand
 fingerprint. `--demand-seed` is independent of the city `--seed`, so the same
 city can carry different demand and vice versa.
 
+```bash
+# M3 — pod fleet
+python -m app.cli.main fleet-demo
+python -m app.cli.main fleet-demo --pods 100 --passengers 1000
+python -m app.cli.main fleet-demo --pods 40 --capacity 6 --profile peak_hour
+python -m app.cli.main fleet-demo --pods 20 --passengers 200 --tick-minutes 5
+python -m app.cli.main fleet-demo --pods 50 --fleet-seed 7 --demand-seed 7
+```
+
+`fleet-demo` prints the fleet size and capacity, trip counts, assignments and
+completions, average occupancy and utilisation, distance, energy, the final pod
+states and the fleet fingerprint. `--fleet-seed`, `--demand-seed` and the city
+`--seed` are all independent.
+
+```bash
+# M4 — swarm formation and platooning
+python -m app.cli.main swarm-demo
+python -m app.cli.main swarm-demo --pods 100 --passengers 1000
+python -m app.cli.main swarm-demo --pods 40 --formation-delay 10 --max-swarm-size 6
+python -m app.cli.main swarm-demo --pods 30 --profile peak_hour --examples 5
+```
+
+`swarm-demo` prints the thresholds in force, the swarms formed with their
+corridors, split counts, participation, the **independent-vs-swarm comparison**,
+the road-space estimate with its assumption spelled out, a preview of planned
+(never executed) reposition requests, and both fingerprints.
+
 Exit codes: `0` success, `1` no route, `2` invalid input or scenario,
 `3` A*/Dijkstra cost mismatch (should never happen).
 
-## 10. How to run tests
+## 12. How to run tests
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -339,9 +731,9 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-184 test functions (275 cases with parametrization) across models, network,
-routing, determinism, edge cases, route-switch regression and the M2 demand
-layer. Highlights: A* and Dijkstra costs match for **all 462 ordered node
+428 test functions (614 cases with parametrization) across models, network,
+routing, determinism, edge cases, route-switch regression, and the M2 demand,
+M3 fleet and M4 swarm layers. Highlights: A* and Dijkstra costs match for **all 462 ordered node
 pairs**, and again under random congestion; the heuristic is checked for
 admissibility against true costs from every node to every goal.
 
@@ -356,6 +748,36 @@ snapshot fingerprints, scenario loading, empty/one-passenger/two-node edge
 cases, and a 10,000-passenger performance check. One test walks the lower
 layers to prove none of them imports `app.demand`.
 
+M3 contributes 143 test functions (205 cases) covering pod validation and every
+illegal state transition, pod-id and fleet-generation determinism (including a
+**separate-process** check), fleet size and initial placement, capacity
+validation and occupancy, assignment and its rejection on capacity, battery or
+location, deterministic assignment ordering, route attachment matching M1's
+router exactly, movement across single- and multi-edge routes, edge completion
+and arrival, trip completion and pod release, battery consumption and clamping at
+both bounds, charging and unavailability, fleet metrics reconciled against the
+fleet and records, tick-by-tick and end-state determinism, congestion changing a
+pod's travel time **and** its energy, empty-fleet and zero-trip edge cases, and a
+100-pod / 1,000-trip benchmark. Further tests assert that a fleet run leaves M1's
+traffic and M2's demand untouched, that A*/Dijkstra still agree afterwards, and
+that no lower layer imports `app.fleet`.
+
+M4 contributes 101 test functions (134 cases) covering swarm validation and the
+minimum size of two, deterministic swarm ids, sorted pod ordering, each of the
+five compatibility rules in isolation, shared-prefix and corridor-metric
+computation, divergence detection, the formation algorithm's determinism and
+independence from input order, `max_swarm_size`, leader selection, lockstep
+platoon movement, the four-pod → three-plus-one split, partial continuation,
+independent-pod preservation, rejoining, the stability window and the absence of
+oscillation, congestion changing compatibility in **both** directions, the swarm
+metrics and their reconciliation, the independent-vs-swarm comparison, empty
+fleet / zero trip / single pod / no-compatible-pod cases, tick-by-tick and
+separate-process determinism, and the rebalancing hook's read-only contract.
+Further tests assert that platooning grants no distance or energy discount, that
+`enable_swarms=False` reproduces M3 fingerprint-for-fingerprint, that
+`PodStatus` still has no swarm states, and that no lower layer imports
+`app.swarm`.
+
 `tests/test_route_switch_regression.py` (M1.1) pins the end-to-end behaviour that
 congestion can change the chosen route. On the seed-42 baseline,
 North Station -> East Hub is normally `E009 -> E011` via Northgate Junction
@@ -367,7 +789,7 @@ route is genuinely cheaper under the modified costs, that Dijkstra and A* still
 agree before/after/restored, that repeated executions are bit-identical, and that
 restoring the original traffic restores the original route and cost exactly.
 
-## 11. Known limitations
+## 13. Known limitations
 
 * Synthetic data only; no calibration against real traffic.
 * Vehicle counts are static inputs — there is no traffic propagation, queueing,
@@ -393,18 +815,74 @@ M2 demand:
 * Trips are routed at the moment you ask, all against the same network state; a
   trip requested at 08:00 and one at 19:00 see identical traffic unless you
   change it yourself. There is no time-dependent routing (same M1 limitation).
-* No vehicles, capacity limits, pods, grouping or platooning — a `TripRequest`
-  is a wish to travel, not a booking.
+* No grouping or platooning — a `TripRequest` is a wish to travel, not a booking.
 
-## 12. Future milestones
+M3 fleet:
+
+* **Synthetic fleet, and the battery model is an approximation, not physics.**
+  Energy scales linearly with distance and the congestion multiplier; charging is
+  linear. Gradients, mass, payload, regenerative braking, temperature, battery
+  ageing, charging curves and auxiliary loads are all ignored.
+* **No repositioning, and this is the dominant limitation.** A pod is only
+  eligible for a trip starting at the node it is already parked on; it never
+  drives empty to a pickup. With 100 pods and 1,000 trips this — not fleet
+  capacity — is what bounds the completion rate: pod utilisation sits near 6 %,
+  so the fleet is far from busy, yet roughly half the trips find no co-located
+  pod before the dispatch timeout. Repositioning and rebalancing are
+  fleet-optimisation concerns deferred with M4.
+* Assignment is local and greedy (lowest eligible `pod_id`), never globally
+  optimised, so it can strand a nearby trip by committing a pod to an earlier one.
+* One pod serves one trip at a time. No ride pooling, so separate parties never
+  share a pod even when the seats would fit.
+* An edge's cost is fixed once the pod is on it, so congestion appearing
+  mid-traversal does not affect that edge (documented under *Movement*).
+* Charging happens wherever the pod stands — there are no charging stations,
+  queues or connector limits, and a pod occupies no space while charging.
+* A pod that somehow reaches 0 % mid-route is clamped at 0 and keeps moving
+  rather than stranding; the battery reserve check at assignment is what makes
+  that essentially unreachable, not a physical guarantee.
+* The dispatch timeout (`max_trip_wait_min`, 60 min) is a policy assumption, and
+  it is what makes a run terminate rather than wait forever.
+
+M4 swarms:
+
+* **Formation is rule-based and greedy, not optimal.** The planner admits pods in
+  `pod_id` order, so taking a pod early can prevent a larger group later. It is a
+  reproducible baseline; no optimality is claimed.
+* **The road-occupancy figure rests on one invented constant.** The
+  `formation_occupancy_factor` of 0.4 is an assumption about headway, not a
+  measurement, and the "benefit" it produces is road space only — never fuel,
+  energy, emissions or time.
+* **Co-location is inherited from M3 and dominates the results.** Pods only
+  platoon if they are already at the same node, so on the seed-42 city with 100
+  pods and 1,000 trips just 28 swarms form, almost all of size 2 (43 % of pods
+  platoon at least once). With repositioning — M5's job — far more pods would be
+  co-located and the numbers would look very different.
+* **Platooning costs riders time here.** Waiting up to `max_formation_delay_min`
+  raises average wait and completion time. Coordination is not free.
+* Formation only happens at a departure or a divergence node, never mid-edge, so a
+  pod that would have been a good partner two minutes into its trip is missed.
+* The corridor must be a common *prefix*; pods whose paths merge later, cross, or
+  run the same road in opposite directions never platoon.
+* Nothing physical is modelled about being in a platoon — no inter-pod spacing,
+  no coupling or decoupling time, no leader-follower dynamics, no magnetic
+  linking, and no limit on how much of a road a formation may occupy.
+* Swarm capacity is reported as the sum of member capacities but grants **no
+  pooling**: a passenger is never moved between pods, so a full pod and an empty
+  one in the same swarm cannot share.
+* Rebalancing is an interface with a naive reference planner, nothing more.
+
+## 14. Future milestones
 
 * **M1** — deterministic city + network foundation ✅
 * **M1.1** — route-switch regression validation ✅
 * **M2** — deterministic passenger demand model ✅
-* **M3** — pod simulation (next; not started)
-* Later — swarm formation, platooning / splitting on trunk corridors,
-  predictive demand, AI-assisted control, dashboard, impact comparison.
+* **M3** — deterministic pod fleet simulation ✅
+* **M4** — deterministic swarm formation and platooning ✅
+* **M5** — adaptive fleet rebalancing (next; not started — M4 ships only the hook)
+* Later — predictive demand, AI-assisted control, dashboard, impact comparison.
 
 The eventual pipeline is `passenger demand → trip requests → routing → pod
-grouping → swarm formation`. M2 implements the first two stages plus the routing
-integration; everything downstream is deliberately absent.
+grouping → swarm formation`. M1–M4 implement all of it. The obvious next step is
+the limitation M3 exposed and M4 only hooked: moving idle pods to where demand
+actually is.

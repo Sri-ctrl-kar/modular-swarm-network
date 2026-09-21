@@ -93,3 +93,107 @@ def tiny_profile():
         commuter_share=0.5,
         gravity_distance_exponent=1.0,
     )
+
+
+# --- M3 fleet fixtures -----------------------------------------------------
+@pytest.fixture
+def fleet_config():
+    from app.fleet.config import DEFAULT_FLEET_CONFIG
+    return DEFAULT_FLEET_CONFIG
+
+
+@pytest.fixture
+def city_fleet(city_graph):
+    """A small deterministic fleet on the synthetic city."""
+    from app.fleet import generate_fleet
+    return generate_fleet(city_graph, fleet_size=20, seed=42)
+
+
+@pytest.fixture
+def diamond_fleet(diamond_graph):
+    """One pod parked at A, the origin of the diamond's routes."""
+    from app.fleet.models import Pod
+    from app.fleet.pod_fleet import PodFleet
+    return PodFleet(diamond_graph, [Pod(pod_id="POD00000", capacity=4, current_node_id="A")])
+
+
+@pytest.fixture
+def make_trip():
+    """Build a TripRequest with sensible defaults."""
+    from app.demand.models import TripRequest
+
+    def _make(origin, destination, trip_id="T000000", party_size=1, request_time_min=0.0,
+              passenger_id="P000000", purpose="commute", bucket="morning_peak"):
+        return TripRequest(trip_id=trip_id, passenger_id=passenger_id, origin_node_id=origin,
+                           destination_node_id=destination, request_time_min=request_time_min,
+                           party_size=party_size, trip_purpose=purpose, time_bucket=bucket)
+    return _make
+
+
+# --- M4 swarm fixtures -----------------------------------------------------
+@pytest.fixture
+def swarm_config():
+    from app.swarm import DEFAULT_SWARM_CONFIG
+    return DEFAULT_SWARM_CONFIG
+
+
+@pytest.fixture
+def corridor_graph():
+    """A trunk corridor with a fork, built so swarm behaviour is exactly checkable.
+
+        H0 --C1--> H1 --C2--> H2 --C3--> H3 --HE--> M --ME--> E
+                                            \\--HF--> F
+        H0 --X1--> X  --X2--> E     (a slower alternative, reaching E only)
+
+    Distances/times, all deliberately round:
+
+    * corridor C1,C2,C3      3 edges, 12 km, 15 min   (the shared run H0..H3)
+    * E tail HE,ME           2 edges,  8 km, 10 min   (so E-bound pods can keep
+                                                       platooning after H3)
+    * F tail HF              1 edge,   4 km,  5 min
+    * H0->E via corridor    20 km, 25 min   |  via X: 20 km, 27 min (loses)
+    * H0->F via corridor    16 km, 20 min   |  no alternative exists
+
+    Congesting C3 flips E onto the X route while F, having no alternative, stays
+    on the corridor — which is how a test shows congestion changing compatibility.
+    """
+    g = NetworkGraph()
+    # 0.03 deg of longitude is ~3.34 km, comfortably under the 4 km road distance,
+    # so M1's geometry rule (road >= straight line) holds on every edge.
+    coords = {"H0": (0.0, 0.00), "H1": (0.0, 0.03), "H2": (0.0, 0.06), "H3": (0.0, 0.09),
+              "M": (0.0, 0.12), "E": (0.015, 0.15), "F": (-0.015, 0.12), "X": (0.04, 0.06)}
+    for node_id, (lat, lon) in coords.items():
+        g.add_node(_node(node_id, lat, lon, "station"))
+    for src, dst, eid in (("H0", "H1", "C1"), ("H1", "H2", "C2"), ("H2", "H3", "C3")):
+        g.add_edge(_edge(eid, src, dst, 4.0, 5.0, capacity=3600, road_type="trunk"))
+    g.add_edge(_edge("HE", "H3", "M", 4.0, 5.0, capacity=1500))
+    g.add_edge(_edge("ME", "M", "E", 4.0, 5.0, capacity=1500))
+    g.add_edge(_edge("HF", "H3", "F", 4.0, 5.0, capacity=1500))
+    g.add_edge(_edge("X1", "H0", "X", 9.0, 13.0, capacity=1500))
+    g.add_edge(_edge("X2", "X", "E", 11.0, 14.0, capacity=1500))
+    return g
+
+
+@pytest.fixture
+def make_corridor_fleet(corridor_graph):
+    """Put N pods at H0 and assign each a trip to E or F, returning (fleet, sim)."""
+    from app.demand.models import TripRequest
+    from app.fleet import DEFAULT_FLEET_CONFIG, Pod, PodFleet
+    from app.swarm import DEFAULT_SWARM_CONFIG, SwarmSimulation
+
+    def _make(destinations, *, swarm_config=None, enable_swarms=True, party_size=1,
+              fleet_config=DEFAULT_FLEET_CONFIG, graph=None):
+        graph = graph if graph is not None else corridor_graph
+        pods = [Pod(pod_id=f"POD{i:05d}", capacity=4, current_node_id="H0")
+                for i in range(len(destinations))]
+        fleet = PodFleet(graph, pods)
+        trips = [TripRequest(trip_id=f"T{i:06d}", passenger_id=f"P{i:06d}", origin_node_id="H0",
+                             destination_node_id=dest, request_time_min=0.0,
+                             party_size=party_size, trip_purpose="commute",
+                             time_bucket="morning_peak")
+                 for i, dest in enumerate(destinations)]
+        simulation = SwarmSimulation(
+            graph, fleet, trips, fleet_config,
+            swarm_config=swarm_config or DEFAULT_SWARM_CONFIG, enable_swarms=enable_swarms)
+        return fleet, simulation
+    return _make
