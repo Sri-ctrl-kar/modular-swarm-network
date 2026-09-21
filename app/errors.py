@@ -70,3 +70,27 @@ class DemandProfileError(DemandError, ValueError):
 
 class DemandGenerationError(DemandError):
     """Demand generation received inputs it cannot satisfy deterministically."""
+
+
+class FleetError(SwarmNetworkError):
+    """Base class for pod-fleet (M3) errors."""
+
+
+class FleetConfigError(FleetError, ValueError):
+    """A fleet configuration or initialisation profile is malformed."""
+
+
+class PodStateError(FleetError):
+    """An illegal pod state transition or an operation invalid for a pod's state."""
+
+
+class PodNotFoundError(FleetError):
+    """A referenced pod id does not exist in the fleet."""
+
+
+class DuplicatePodError(FleetError):
+    """A pod id is already present in the fleet."""
+
+
+class AssignmentError(FleetError):
+    """A trip cannot be assigned to the requested pod."""

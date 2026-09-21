@@ -93,3 +93,38 @@ def tiny_profile():
         commuter_share=0.5,
         gravity_distance_exponent=1.0,
     )
+
+
+# --- M3 fleet fixtures -----------------------------------------------------
+@pytest.fixture
+def fleet_config():
+    from app.fleet.config import DEFAULT_FLEET_CONFIG
+    return DEFAULT_FLEET_CONFIG
+
+
+@pytest.fixture
+def city_fleet(city_graph):
+    """A small deterministic fleet on the synthetic city."""
+    from app.fleet import generate_fleet
+    return generate_fleet(city_graph, fleet_size=20, seed=42)
+
+
+@pytest.fixture
+def diamond_fleet(diamond_graph):
+    """One pod parked at A, the origin of the diamond's routes."""
+    from app.fleet.models import Pod
+    from app.fleet.pod_fleet import PodFleet
+    return PodFleet(diamond_graph, [Pod(pod_id="POD00000", capacity=4, current_node_id="A")])
+
+
+@pytest.fixture
+def make_trip():
+    """Build a TripRequest with sensible defaults."""
+    from app.demand.models import TripRequest
+
+    def _make(origin, destination, trip_id="T000000", party_size=1, request_time_min=0.0,
+              passenger_id="P000000", purpose="commute", bucket="morning_peak"):
+        return TripRequest(trip_id=trip_id, passenger_id=passenger_id, origin_node_id=origin,
+                           destination_node_id=destination, request_time_min=request_time_min,
+                           party_size=party_size, trip_purpose=purpose, time_bucket=bucket)
+    return _make

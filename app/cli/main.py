@@ -1,4 +1,4 @@
-"""CLI for Milestones 1 and 2.
+"""CLI for Milestones 1, 2 and 3.
 
 Examples:
     python -m app.cli.main route --from "North Station" --to "Airport"
@@ -9,6 +9,7 @@ Examples:
     python -m app.cli.main export-scenario --seed 42 --output scenarios/baseline.json
     python -m app.cli.main demand-demo --profile baseline --passengers 1000
     python -m app.cli.main demand-demo --profile peak_hour --passengers 2000 --no-routing
+    python -m app.cli.main fleet-demo --pods 100 --passengers 1000
 
 Results go to stdout; logs and errors go to stderr. Exit codes: 0 ok,
 1 no route, 2 invalid input / scenario error.
@@ -20,6 +21,7 @@ import argparse
 import logging
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -33,6 +35,13 @@ from app.demand import (
     route_trips,
 )
 from app.errors import ModelValidationError, NoRouteError, SwarmNetworkError
+from app.fleet import (
+    DEFAULT_FLEET_CONFIG,
+    DEFAULT_FLEET_SEED,
+    FleetSimulation,
+    compute_fleet_metrics,
+    generate_fleet,
+)
 from app.models.route import Route
 from app.network.builder import LoadedScenario, dump_scenario, load_scenario
 from app.network.synthetic_city import build_synthetic_city, generate_synthetic_city_dict
@@ -214,6 +223,75 @@ def cmd_demand_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fleet_demo(args: argparse.Namespace) -> int:
+    """Run the pod fleet against generated demand (M3).
+
+    Pods are independent vehicles here: swarm/platoon formation is deferred to M4.
+    """
+    scenario = _load(args)
+    state = SimulationState.from_scenario(scenario)
+    graph = state.graph
+    profile = resolve_demand_profile(args.profile)
+    config = DEFAULT_FLEET_CONFIG
+    if args.capacity is not None:
+        config = replace(config, default_pod_capacity=args.capacity)
+    if args.tick_minutes is not None:
+        config = replace(config, tick_minutes=args.tick_minutes)
+
+    demand = generate_demand(graph, seed=args.demand_seed, passenger_count=args.passengers,
+                             profile=profile)
+    fleet = generate_fleet(graph, fleet_size=args.pods, seed=args.fleet_seed,
+                           config=config, profile=profile)
+    simulation = FleetSimulation(graph, fleet, demand.trips, config,
+                                 algorithm=args.algorithm)
+    run = simulation.run(max_ticks=args.max_ticks)
+    metrics = compute_fleet_metrics(fleet, simulation.records(), simulation.time_min)
+
+    print(_header(scenario, state))
+    print("Pod fleet [SYNTHETIC — approximated energy model, not physics]")
+    print("-------------------------------------------------------------")
+    print("Pods are independent in M3; swarm/platoon formation is deferred to M4.")
+    print(f"\nFleet: {metrics.total_pods} pods (seed {args.fleet_seed})")
+    print(f"Capacity: {config.default_pod_capacity} seats per pod "
+          f"({metrics.total_capacity} seats total)")
+    print(f"Demand profile: {profile.profile_id} (seed {args.demand_seed})")
+    print(f"Trips: {metrics.total_trips}")
+    print(f"Simulated: {run.ticks} ticks of {config.tick_minutes:g} min "
+          f"-> minute {run.end_time_min:g} ({run.stopped_because})")
+
+    print("\nTrips")
+    print(f"  Assigned and completed: {metrics.completed_trips}"
+          f"  ({'n/a' if metrics.completion_rate is None else format(metrics.completion_rate, '.1%')})")
+    print(f"  Unassigned (no pod at origin in time): {metrics.unassigned_trips}")
+    print(f"  Unroutable (no path exists): {metrics.unroutable_trips}")
+    print(f"  Average wait before pickup: {metrics.average_trip_wait_time_min} min")
+    print(f"  Average completion time: {metrics.average_trip_completion_time_min} min")
+
+    print("\nFleet activity")
+    print(f"  Passengers carried: {metrics.total_passengers_carried}")
+    print(f"  Average occupancy: {metrics.average_passenger_occupancy} of "
+          f"{config.default_pod_capacity} seats"
+          f"  ({'n/a' if metrics.average_occupancy_rate is None else format(metrics.average_occupancy_rate, '.1%')})")
+    print(f"  Average pod utilization (driving time): "
+          f"{'n/a' if metrics.average_pod_utilization is None else format(metrics.average_pod_utilization, '.1%')}")
+    print(f"  Distance travelled: {metrics.total_distance_km} km")
+    print(f"  Driving time: {metrics.total_travel_time_min} min")
+
+    print("\nEnergy (approximation)")
+    print(f"  Consumed: {metrics.total_energy_kwh} kWh")
+    print(f"  Average: {metrics.average_energy_per_km} kWh/km")
+    batteries = [pod.battery_percent for pod in fleet.pods()]
+    if batteries:
+        print(f"  Battery: min {min(batteries):.1f}%  mean {sum(batteries) / len(batteries):.1f}%")
+
+    print("\nFinal fleet state")
+    for status, count in sorted(fleet.count_by_status().items()):
+        print(f"  {status:<10} {count}")
+
+    print(f"\nFleet fingerprint: {simulation.snapshot().fingerprint()}")
+    return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     text = dump_scenario(generate_synthetic_city_dict(args.seed))
     if args.output == "-":
@@ -225,7 +303,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="app.cli.main", description="Modular Swarm Network — M1 + M2 CLI")
+    parser = argparse.ArgumentParser(prog="app.cli.main", description="Modular Swarm Network — M1 + M2 + M3 CLI")
     parser.add_argument("--log-level", default="WARNING",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="log level (logs go to stderr)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -271,6 +349,20 @@ def build_parser() -> argparse.ArgumentParser:
     demand.add_argument("--top", type=int, default=5, help="how many OD pairs to list")
     add_source(demand)
     demand.set_defaults(func=cmd_demand_demo)
+
+    fleet = sub.add_parser("fleet-demo", help="run the pod fleet against generated demand")
+    fleet.add_argument("--pods", type=int, default=100, help="fleet size")
+    fleet.add_argument("--capacity", type=int, default=None, help="seats per pod")
+    fleet.add_argument("--passengers", type=int, default=1000, help="synthetic passengers to generate")
+    fleet.add_argument("--profile", default="baseline",
+                       help="demand profile name (baseline, peak_hour) or a demand JSON path")
+    fleet.add_argument("--fleet-seed", type=int, default=DEFAULT_FLEET_SEED)
+    fleet.add_argument("--demand-seed", type=int, default=DEFAULT_DEMAND_SEED)
+    fleet.add_argument("--tick-minutes", type=float, default=None, help="simulation tick length")
+    fleet.add_argument("--max-ticks", type=int, default=100_000)
+    fleet.add_argument("--algorithm", choices=["astar", "dijkstra"], default="astar")
+    add_source(fleet)
+    fleet.set_defaults(func=cmd_fleet_demo)
 
     export = sub.add_parser("export-scenario", help="write the synthetic city as scenario JSON")
     export.add_argument("--seed", type=int, default=DEFAULT_SEED)
