@@ -1,4 +1,4 @@
-"""CLI for Milestone 1.
+"""CLI for Milestones 1 and 2.
 
 Examples:
     python -m app.cli.main route --from "North Station" --to "Airport"
@@ -7,6 +7,8 @@ Examples:
     python -m app.cli.main congestion-demo --from "North Station" --to "Airport"
     python -m app.cli.main info
     python -m app.cli.main export-scenario --seed 42 --output scenarios/baseline.json
+    python -m app.cli.main demand-demo --profile baseline --passengers 1000
+    python -m app.cli.main demand-demo --profile peak_hour --passengers 2000 --no-routing
 
 Results go to stdout; logs and errors go to stderr. Exit codes: 0 ok,
 1 no route, 2 invalid input / scenario error.
@@ -22,6 +24,14 @@ from pathlib import Path
 from typing import Sequence
 
 from app.config import DEFAULT_SCENARIO_PATH, DEFAULT_SEED
+from app.demand import (
+    DEFAULT_DEMAND_SEED,
+    buckets_within_horizon,
+    compute_metrics,
+    generate_demand,
+    resolve_demand_profile,
+    route_trips,
+)
 from app.errors import ModelValidationError, NoRouteError, SwarmNetworkError
 from app.models.route import Route
 from app.network.builder import LoadedScenario, dump_scenario, load_scenario
@@ -142,6 +152,68 @@ def cmd_info(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_demand_demo(args: argparse.Namespace) -> int:
+    """Generate synthetic demand and summarise it (M2). No vehicles are simulated."""
+    scenario = _load(args)
+    state = SimulationState.from_scenario(scenario)
+    profile = resolve_demand_profile(args.profile)
+    demand = generate_demand(
+        state.graph,
+        seed=args.demand_seed,
+        passenger_count=args.passengers,
+        profile=profile,
+        trips_per_passenger=args.trips_per_passenger,
+        horizon_min=args.horizon_min,
+    )
+    routed = None if args.no_routing else route_trips(state.graph, demand.trips, args.algorithm)
+    metrics = compute_metrics(demand, routed, top_n=args.top)
+    snapshot = demand.snapshot()
+    graph = state.graph
+
+    print(_header(scenario, state))
+    print("Demand [SYNTHETIC — not calibrated to real-world mobility data]")
+    print("-------------------------------------------------------------")
+    print(f"Demand profile: {profile.profile_id} (seed {demand.seed})")
+    print(f"  {profile.description}")
+    print(f"Passengers: {metrics.total_passengers}")
+    print(f"Trip requests: {metrics.total_trip_requests}")
+    print(f"Total passenger demand: {metrics.total_passenger_volume}")
+    print(f"Average party size: {metrics.average_party_size}")
+    print(f"Unique origins / destinations: {metrics.unique_origins} / {metrics.unique_destinations}")
+    print(f"OD pairs with demand: {metrics.od_pairs_used}")
+
+    print(f"\nTop {args.top} OD pairs (by passengers):")
+    for origin, destination, passengers in metrics.top_od_pairs:
+        trips = demand.matrix.trips_for(origin, destination)
+        print(f"  {graph.get_node(origin).name:<20} -> {graph.get_node(destination).name:<20} "
+              f"{passengers:>5} passengers  ({trips} trips)")
+
+    horizon_note = "" if args.horizon_min is None else f", clipped to the first {args.horizon_min:g} min"
+    print(f"\nDemand by time bucket (passengers{horizon_note}):")
+    trips_by_bucket = dict(metrics.trips_by_time_bucket)
+    # The buckets the generator actually drew from, so --horizon-min is reported honestly.
+    effective = {b.name: b for b in buckets_within_horizon(profile, args.horizon_min)}
+    for name, passengers in metrics.demand_by_time_bucket:
+        windows = " ".join(f"{int(s)//60:02d}:{int(s)%60:02d}-{int(e)//60:02d}:{int(e)%60:02d}"
+                           for s, e in effective[name].windows)
+        marker = "  <- peak" if name == metrics.peak_bucket else ""
+        print(f"  {name:<14} {passengers:>6} passengers  {trips_by_bucket.get(name, 0):>6} trips  "
+              f"[{windows}]{marker}")
+
+    if routed is None:
+        print("\nRouting: skipped (--no-routing)")
+    else:
+        print(f"\nRouting ({ALGORITHM_LABELS.get(args.algorithm, args.algorithm)}, current traffic):")
+        print(f"  Routed trips: {metrics.routed_trips}")
+        print(f"  Unroutable trips: {metrics.unroutable_trips}")
+        print(f"  Average route distance: {metrics.average_route_distance_km} km")
+        print(f"  Average travel time: {metrics.average_route_travel_time_min} min")
+        print(f"  Average free-flow time: {metrics.average_free_flow_travel_time_min} min")
+
+    print(f"\nDemand fingerprint: {snapshot.fingerprint()}")
+    return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     text = dump_scenario(generate_synthetic_city_dict(args.seed))
     if args.output == "-":
@@ -153,7 +225,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="app.cli.main", description="Modular Swarm Network — M1 CLI")
+    parser = argparse.ArgumentParser(prog="app.cli.main", description="Modular Swarm Network — M1 + M2 CLI")
     parser.add_argument("--log-level", default="WARNING",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="log level (logs go to stderr)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -184,6 +256,21 @@ def build_parser() -> argparse.ArgumentParser:
     info = sub.add_parser("info", help="network statistics")
     add_source(info)
     info.set_defaults(func=cmd_info)
+
+    demand = sub.add_parser("demand-demo", help="generate synthetic passenger demand and summarise it")
+    demand.add_argument("--profile", default="baseline",
+                        help="built-in profile name (baseline, peak_hour) or a demand JSON path")
+    demand.add_argument("--passengers", type=int, default=1000, help="number of synthetic passengers")
+    demand.add_argument("--trips-per-passenger", type=int, default=1)
+    demand.add_argument("--demand-seed", type=int, default=DEFAULT_DEMAND_SEED,
+                        help="seed for demand generation (independent of the city seed)")
+    demand.add_argument("--horizon-min", type=float, default=None,
+                        help="clip demand to the first N minutes of the day")
+    demand.add_argument("--algorithm", choices=["astar", "dijkstra"], default="astar")
+    demand.add_argument("--no-routing", action="store_true", help="skip routing the generated trips")
+    demand.add_argument("--top", type=int, default=5, help="how many OD pairs to list")
+    add_source(demand)
+    demand.set_defaults(func=cmd_demand_demo)
 
     export = sub.add_parser("export-scenario", help="write the synthetic city as scenario JSON")
     export.add_argument("--seed", type=int, default=DEFAULT_SEED)

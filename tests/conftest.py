@@ -50,3 +50,46 @@ def diamond_graph():
 @pytest.fixture
 def city():
     return build_synthetic_city(42)
+
+
+# --- M2 demand fixtures ----------------------------------------------------
+@pytest.fixture
+def city_graph(city):
+    return city.graph
+
+
+@pytest.fixture
+def demand(city_graph):
+    """A small but representative baseline demand set (fast for tests)."""
+    from app.demand import generate_demand
+    return generate_demand(city_graph, seed=42, passenger_count=300)
+
+
+@pytest.fixture
+def tiny_graph():
+    """Two nodes, one two-way link: the smallest graph that can carry demand."""
+    g = NetworkGraph()
+    g.add_node(_node("home", 0.0, 0.0, "station", name="Home"))
+    g.add_node(_node("work", 0.0, 0.02, "station", name="Work"))
+    g.add_edge(_edge("hw", "home", "work", 2.5, 4.0))
+    g.add_edge(_edge("wh", "work", "home", 2.5, 4.0))
+    return g
+
+
+@pytest.fixture
+def tiny_profile():
+    """One bucket, both nodes usable, so tiny graphs can generate demand."""
+    from app.demand.config import DemandProfile, TimeBucket
+    return DemandProfile(
+        profile_id="tiny",
+        description="Single-bucket profile for small-graph tests.",
+        buckets=(TimeBucket(name="morning_peak", windows=((360.0, 600.0),), trip_share=1.0,
+                            production={"residential": 1.0, "mixed": 1.0},
+                            attraction={"employment": 1.0, "mixed": 1.0}),),
+        party_size_distribution=((1, 0.5), (2, 0.5)),
+        node_roles={"home": "residential", "work": "employment"},
+        default_roles_by_node_type={"station": "mixed", "terminal": "hub", "intersection": "through"},
+        home_role_weights={"residential": 1.0},
+        commuter_share=0.5,
+        gravity_distance_exponent=1.0,
+    )

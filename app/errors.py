@@ -58,3 +58,15 @@ class InvalidCostError(RoutingError, ValueError):
 
 class ScenarioError(SwarmNetworkError):
     """A scenario file is missing, malformed, or semantically invalid."""
+
+
+class DemandError(SwarmNetworkError):
+    """Base class for passenger-demand (M2) errors."""
+
+
+class DemandProfileError(DemandError, ValueError):
+    """A demand profile / demand scenario file is malformed or inconsistent."""
+
+
+class DemandGenerationError(DemandError):
+    """Demand generation received inputs it cannot satisfy deterministically."""
