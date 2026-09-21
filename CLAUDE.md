@@ -5,8 +5,8 @@ A* admissibility proof and the synthetic-city assumptions.
 
 ## Status
 
-Milestones 1, 1.1, 2, 3 and 4 are complete and green: 428 test functions /
-614 parametrized cases, all passing.
+Milestones 1, 1.1, 2, 3 and 4 are complete and green: 455 test functions /
+643 parametrized cases, all passing.
 
 * **M1** — deterministic city + network foundation.
 * **M1.1** — `tests/test_route_switch_regression.py`: congestion can change the
@@ -19,6 +19,9 @@ Milestones 1, 1.1, 2, 3 and 4 are complete and green: 428 test functions /
 * **M4** — `app/swarm/`: deterministic rule-based swarm formation, platoon
   movement, splitting at divergence, swarm metrics, an independent-vs-swarm
   comparison, and a **rebalancing hook only**.
+* **M4.1** — `tests/test_swarm_metric_semantics.py`: the comparison metrics were
+  audited, found numerically correct, and renamed to carry their units; the
+  formulas are now pinned by tests.
 
 Next milestone is **M5: adaptive fleet rebalancing** — not started. Do not
 implement adaptive rebalancing, magnetic linking, LLM integration or a dashboard
@@ -96,6 +99,13 @@ python -m app.cli.main swarm-demo --pods 100 --passengers 1000
    grant a distance, time or energy discount: the coordination benefit is a
    **road-space estimate** resting on `formation_occupancy_factor`, and no
    aerodynamic, fuel or emissions saving may be claimed anywhere.
+   **Units are part of the contract:** `*_km` fields are physical kilometres
+   driven, `*_equiv_km` fields are single-pod-equivalent road space. Never add or
+   difference across the two, and keep the names textually distinct — a test
+   enforces the split. `compute_swarm_metrics` must keep defaulting to the
+   simulation's own `swarm_config`, or occupancy gets scored under a factor the
+   run never used. Cross-mode raw totals are not like-for-like (the modes serve
+   different trips); only `road_occupancy_saving_percent` compares directly.
 12. **Rebalancing stays a hook.** `app/swarm/rebalancing.py` plans and returns
    `RepositionRequest`s; nothing in M4 executes them, and `plan()` must stay
    read-only. Adaptive rebalancing is M5.

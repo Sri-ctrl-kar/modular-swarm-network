@@ -307,9 +307,9 @@ def test_metrics_define_corridor_and_pod_km_separately(corridor_graph, make_corr
     assert metrics.coordinated_pod_km == pytest.approx(
         sum(s.coordinated_pod_km() for s in sim.swarms()))
     # Road occupancy is below raw pod-km, and the gap is the claimed benefit.
-    assert metrics.road_occupancy_km < metrics.pod_distance_km
-    assert metrics.coordination_benefit_km == pytest.approx(
-        metrics.pod_distance_km - metrics.road_occupancy_km, abs=1e-3)
+    assert metrics.road_occupancy_equiv_km < metrics.pod_distance_km
+    assert metrics.road_occupancy_saved_equiv_km == pytest.approx(
+        metrics.pod_distance_km - metrics.road_occupancy_equiv_km, abs=1e-3)
     assert metrics.formation_occupancy_factor == DEFAULT_SWARM_CONFIG.formation_occupancy_factor
 
 
@@ -327,7 +327,7 @@ def test_metrics_reconcile_with_the_simulation(city_graph):
     assert metrics.completed_swarm_count == sim.swarm_status_counts()["completed"]
     assert metrics.pod_distance_km == pytest.approx(
         sum(p.total_distance_km for p in fleet), abs=1e-3)
-    assert metrics.independent_pod_km + metrics.coordinated_pod_km == pytest.approx(
+    assert metrics.unplatooned_pod_km + metrics.coordinated_pod_km == pytest.approx(
         metrics.pod_distance_km, abs=1e-2)
     assert 0 <= metrics.distinct_pods_ever_in_a_swarm <= 40
     if metrics.swarm_count:
@@ -347,8 +347,8 @@ def test_metrics_with_swarms_disabled_report_zero_not_none(city_graph):
     assert metrics.average_swarm_size is None            # no swarms, no average
     assert metrics.coordinated_pod_km == 0.0
     assert metrics.total_shared_corridor_distance_km == 0.0
-    assert metrics.coordination_benefit_km == pytest.approx(0.0, abs=1e-6)
-    assert metrics.road_occupancy_km == pytest.approx(metrics.pod_distance_km, abs=1e-3)
+    assert metrics.road_occupancy_saved_equiv_km == pytest.approx(0.0, abs=1e-6)
+    assert metrics.road_occupancy_equiv_km == pytest.approx(metrics.pod_distance_km, abs=1e-3)
 
 
 def test_metrics_are_json_serialisable_and_deterministic(city_graph):
@@ -381,10 +381,10 @@ def test_independent_vs_swarm_on_an_identical_scenario():
     # Only the swarm run platoons; the baseline is plain M3.
     assert comparison.independent_swarm.swarm_count == 0
     assert comparison.swarm_swarm.swarm_count > 0
-    assert comparison.independent_swarm.coordination_benefit_km == pytest.approx(0.0, abs=1e-6)
-    assert comparison.swarm_swarm.coordination_benefit_km > 0
+    assert comparison.independent_swarm.road_occupancy_saved_equiv_km == pytest.approx(0.0, abs=1e-6)
+    assert comparison.swarm_swarm.road_occupancy_saved_equiv_km > 0
     # Road occupancy is the metric coordination is meant to improve.
-    assert comparison.swarm_swarm.road_occupancy_km < comparison.independent_swarm.road_occupancy_km
+    assert comparison.swarm_swarm.road_occupancy_equiv_km < comparison.independent_swarm.road_occupancy_equiv_km
     # The two runs are genuinely different simulations.
     assert comparison.independent_fingerprint != comparison.swarm_fingerprint
     assert comparison.delta("completed_trips") is not None
@@ -498,14 +498,14 @@ def test_determinism_across_separate_processes():
         "d=generate_demand(g, seed=42, passenger_count=200);"
         "s=SwarmSimulation(g, f, d.trips); s.run();"
         "m=compute_swarm_metrics(s);"
-        "print(s.swarm_snapshot().fingerprint(), m.swarm_count, m.split_count, m.coordination_benefit_km)"
+        "print(s.swarm_snapshot().fingerprint(), m.swarm_count, m.split_count, m.road_occupancy_saved_equiv_km)"
     )
     outputs = {subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
                               check=True).stdout.strip() for _ in range(2)}
     sim, _ = _swarm_run()
     metrics = compute_swarm_metrics(sim)
     expected = (f"{sim.swarm_snapshot().fingerprint()} {metrics.swarm_count} "
-                f"{metrics.split_count} {metrics.coordination_benefit_km}")
+                f"{metrics.split_count} {metrics.road_occupancy_saved_equiv_km}")
     assert len(outputs) == 1
     assert outputs.pop() == expected
 
@@ -730,7 +730,10 @@ def test_swarm_demo_cli_runs_and_explains_itself(capsys):
     assert "Splits at divergence:" in out
     assert "Total shared corridor:" in out
     assert "Independent (M3) vs swarm (M4)" in out
-    assert "no fuel, energy or emissions saving is claimed" in out
+    # The disclaimer is wrapped across lines, so compare on words not layout.
+    flat = " ".join(out.split())
+    assert "no fuel, energy or emissions saving is claimed" in flat
+    assert "equiv-km is single-pod-equivalent ROAD SPACE, not distance" in flat
     assert "Rebalancing hook:" in out
     assert "belongs to M5" in out
     assert "Swarm fingerprint:" in out

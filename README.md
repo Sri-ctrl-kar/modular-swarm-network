@@ -623,20 +623,46 @@ formation drives the same edges at the same M1 costs and pays the same M3 batter
 cost as it would alone — a test asserts a platooned pod and a solo pod covering
 the same corridor consume exactly the same.
 
-What coordination changes is modelled road **space**:
+What coordination changes is modelled road **space**. Two different quantities are
+involved, in **two different units**, and the field names keep them apart:
 
-| Metric | Meaning |
-|---|---|
-| `pod_distance_km` | km physically driven by all pods. **Platooning does not reduce this.** |
-| `shared_corridor_distance_km` | corridor km traversed under coordination, counted **once per swarm** |
-| `coordinated_pod_km` | pod-km driven in formation = corridor × members |
-| `road_occupancy_km` | `independent_pod_km + Σ corridor_km × (1 + (n−1) × factor)` |
-| `coordination_benefit_km` | `pod_distance_km − road_occupancy_km` — road space freed |
+* **`km`** — physical kilometres actually driven on the tarmac.
+* **`equiv-km`** — *single-pod-equivalent road space*, where one pod driving alone
+  for one km is 1.0 by definition. These are **not distances**; never add them to
+  or difference them against physical kilometres from elsewhere.
 
-Four pods over a 5 km corridor is **5 corridor-km and 20 pod-km**. The
-`formation_occupancy_factor` (0.4) is a **project assumption about headway** — a
-following pod needs 40 % of an independent pod's road space. It is **not** an
-aerodynamic, fuel, energy or emissions saving, and none is claimed anywhere.
+For each swarm *s*: `d` = corridor length actually travelled together, `n` =
+members, `f` = `formation_occupancy_factor`.
+
+| Metric | Unit | Exact formula | Meaning |
+|---|---|---|---|
+| `pod_distance_km` | km | `Σ pods (pod.total_distance_km)` | physically driven. **Platooning never reduces this.** |
+| `total_shared_corridor_distance_km` | km | `Σ swarms (d)` | corridor length, counted **once per swarm** ("unique corridor distance") |
+| `coordinated_pod_km` | km | `Σ swarms (d × n)` | pod-km driven *while in formation* |
+| `unplatooned_pod_km` | km | `pod_distance_km − coordinated_pod_km` | pod-km driven outside any formation — **including the solo legs of pods that did platoon** |
+| `road_occupancy_equiv_km` | equiv-km | `unplatooned_pod_km + Σ swarms (d × (1 + (n−1) × f))` | estimated road space used |
+| `road_occupancy_saved_equiv_km` | equiv-km | `pod_distance_km − road_occupancy_equiv_km`, identically `Σ swarms (d × (n−1) × (1−f))` | road space freed, **within this run** |
+| `road_occupancy_saving_percent` | % | `100 × saved / pod_distance_km` | scale-free, so this is the only occupancy figure comparable across two runs |
+
+Four pods over a 5 km corridor is **5 corridor-km and 20 pod-km** — a platoon is
+never one vehicle. With no swarms at all, `road_occupancy_equiv_km` reduces
+**exactly** to `pod_distance_km`, because every pod then occupies 1.0 equiv-km per
+km; that is why an independent run reports the same number twice, and a test
+asserts the identity rather than leaving it to coincidence.
+
+The `formation_occupancy_factor` (0.4) is a **project assumption about headway** —
+a following pod needs 40 % of an independent pod's road space. It is **not** an
+aerodynamic, fuel, energy or emissions saving, and none is claimed anywhere. At
+`f = 1.0` the saving is exactly zero by construction, which a test pins.
+
+`compute_swarm_metrics()` defaults to the simulation's **own** `swarm_config`, so
+the occupancy figures cannot silently be scored under a factor the run never used.
+
+Two participation fields are a **snapshot, not a total**:
+`pods_currently_in_swarms` and `pods_currently_independent` describe the instant
+the metrics were taken, so after a finished run they read 0 and *total_pods*. The
+cumulative figure is `distinct_pods_ever_in_a_swarm`, which is what the CLI
+reports.
 
 ### Independent vs swarm: the controlled comparison
 
@@ -646,8 +672,11 @@ scratch so neither inherits the other's traffic or pod positions.
 `enable_swarms=False` reproduces M3 exactly, fingerprint for fingerprint (a test
 asserts that against `FleetSimulation` itself).
 
-Read the comparison carefully: fleet **totals** differ between modes, and not
-because platooning discounts anything. Waiting up to `max_formation_delay_min`
+Read the comparison carefully: the two runs **do not serve the same trips**, so
+their raw totals are not like-for-like and cannot be differenced to isolate the
+coordination effect. Difference `road_occupancy_saving_percent` instead, which is
+scale-free (independent mode is exactly 0 %). Fleet totals differ between modes,
+and not because platooning discounts anything. Waiting up to `max_formation_delay_min`
 shifts departures, so a slightly different set of trips gets served and distance
 and energy totals move with the served set. Waiting also costs riders time, so
 average wait and completion time **rise**. Both effects are reported rather than
@@ -731,7 +760,7 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-428 test functions (614 cases with parametrization) across models, network,
+455 test functions (643 cases with parametrization) across models, network,
 routing, determinism, edge cases, route-switch regression, and the M2 demand,
 M3 fleet and M4 swarm layers. Highlights: A* and Dijkstra costs match for **all 462 ordered node
 pairs**, and again under random congestion; the heuristic is checked for
@@ -777,6 +806,18 @@ Further tests assert that platooning grants no distance or energy discount, that
 `enable_swarms=False` reproduces M3 fingerprint-for-fingerprint, that
 `PodStatus` still has no swarm states, and that no lower layer imports
 `app.swarm`.
+
+`tests/test_swarm_metric_semantics.py` (M4.1) pins the *meaning* of the
+comparison metrics rather than any behaviour: each formula above, the
+`road_occupancy_equiv_km == pod_distance_km` identity when nothing platoons, the
+closed form of the saving, that `d × n` is exact because no member can leave
+mid-corridor, that the occupancy factor scales the saving linearly and gives
+exactly zero at `f = 1.0`, that the `*_currently_*` fields are a snapshot while
+`distinct_pods_ever_in_a_swarm` is the total, that physical-km and equiv-km field
+names stay textually distinct, and that raw cross-mode totals are **not**
+like-for-like. It deliberately asserts nothing about swarm mode being better:
+one test exists specifically to confirm the comparison is free to show swarm mode
+driving further or finishing later.
 
 `tests/test_route_switch_regression.py` (M1.1) pins the end-to-end behaviour that
 congestion can change the chosen route. On the seed-42 baseline,
