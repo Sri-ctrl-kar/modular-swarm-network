@@ -265,3 +265,35 @@ def area_a_fleet(two_area_graph):
         Pod(pod_id=f"POD{i:05d}", capacity=4, current_node_id="A1" if i < 5 else "A2")
         for i in range(10)
     ])
+
+
+# --- M6 orchestration --------------------------------------------------------
+@pytest.fixture
+def ai_simulation(city_graph):
+    """A small city run advanced far enough to have a real, non-trivial state.
+
+    Deliberately modest (30 pods, 200 passengers) so the orchestration tests stay
+    fast; the evaluation scenarios in ``app/orchestration/scenarios.py`` carry the
+    larger, deliberately-posed situations.
+    """
+    from app.demand import generate_demand
+    from app.fleet import generate_fleet
+    from app.rebalancing import RebalancingSimulation
+
+    fleet = generate_fleet(city_graph, fleet_size=30, seed=42)
+    demand = generate_demand(city_graph, seed=42, passenger_count=200)
+    simulation = RebalancingSimulation(city_graph, fleet, demand.trips)
+    simulation.run(until_min=240.0)
+    return simulation
+
+
+@pytest.fixture
+def ai_observation(ai_simulation):
+    from app.orchestration import build_observation
+    return build_observation(ai_simulation)
+
+
+@pytest.fixture
+def mock_provider():
+    from app.orchestration import MockProvider
+    return MockProvider()

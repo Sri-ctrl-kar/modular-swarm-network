@@ -134,3 +134,34 @@ class RepositioningError(RebalancingError):
 
 class ActionValidationError(RebalancingError, ValueError):
     """A proposed action failed the deterministic validator at the M6 boundary."""
+
+
+class OrchestrationError(SwarmNetworkError):
+    """Base class for AI-orchestration (M6) errors."""
+
+
+class OrchestrationConfigError(OrchestrationError, ValueError):
+    """An orchestration configuration value is malformed or outside its bounds."""
+
+
+class ActionSchemaError(OrchestrationError, ValueError):
+    """An AI action does not satisfy the structured action schema."""
+
+
+class ProviderError(OrchestrationError):
+    """An AI provider could not be used, or failed while producing a proposal."""
+
+
+class ProviderConfigurationError(ProviderError, ValueError):
+    """A provider was requested without what it needs — a missing API key, say.
+
+    The message names the *environment variable*, never its value.
+    """
+
+
+class ProviderResponseError(ProviderError):
+    """A provider returned something that is not a parseable structured action."""
+
+
+class ExecutionRefusedError(OrchestrationError):
+    """Execution was attempted without an APPROVED validator verdict."""

@@ -5,8 +5,9 @@ A* admissibility proof and the synthetic-city assumptions.
 
 ## Status
 
-Milestones 1, 1.1, 2, 3, 4, 4.1 and 5 are complete and green: 562 test functions /
-772 parametrized cases, all passing. **M5 completes the deterministic engine.**
+Milestones 1, 1.1, 2, 3, 4, 4.1, 5 and 6 are complete and green: 723 test functions /
+981 parametrized cases, all passing. **M5 completes the deterministic engine; M6 is
+the orchestration layer above it.**
 
 * **M1** — deterministic city + network foundation.
 * **M1.1** — `tests/test_route_switch_regression.py`: congestion can change the
@@ -25,10 +26,17 @@ Milestones 1, 1.1, 2, 3, 4, 4.1 and 5 are complete and green: 562 test functions
 * **M5** — `app/rebalancing/`: deterministic demand forecasting, a spatial demand
   map, eligibility rules, surplus/deficit matching, **empty** pod repositioning
   with its full deadhead cost, and the read-only M6 boundary.
+* **M6** — `app/orchestration/`: an AI orchestration layer that observes the engine
+  through plain frozen values, proposes one of four whitelisted actions, has a
+  deterministic validator rule on it against the live engine, and lets the existing
+  M5/M3 entry points execute it. Mock provider by default; Gemini optional and
+  lazily imported. **M1-M5 were not modified** — the engine is byte-for-byte
+  identical to the M5 commit, and tests pin the layering and the boundary contract
+  that keep it that way.
 
-Next milestone is **M6: the AI orchestration layer** — not started. Do not
-implement Gemini, an LLM, agents, a dashboard or cloud services yet. M6 sits
-*above* the engine and reaches it only through `app/rebalancing/observation.py`.
+Next is the **visual dashboard / UI**, which is not started. Do not build HTTP,
+FastAPI, Streamlit, React or Antigravity UI code. A UI would sit on
+`app/orchestration/api.py`'s six pure-Python operations.
 
 ## Commands
 
@@ -45,12 +53,20 @@ python -m app.cli.main demand-demo --profile peak_hour --passengers 2000 --no-ro
 python -m app.cli.main fleet-demo --pods 100 --passengers 1000
 python -m app.cli.main swarm-demo --pods 100 --passengers 1000
 python -m app.cli.main rebalancing-demo --pods 100 --passengers 1000
+python -m app.cli.main ai-demo --provider mock
+python -m app.cli.main ai-demo --provider mock --scenario C_EXPENSIVE --cycles 2
+pip install -r requirements-gemini.txt   # OPTIONAL, live Gemini only
+python -m app.cli.main ai-demo --provider gemini   # needs $GEMINI_API_KEY
 ```
 
 ## Invariants — do not break these
 
-1. **Stdlib only at runtime.** No Gemini/OpenAI/Anthropic SDKs, no Streamlit,
-   FastAPI, NetworkX, requests, DB or external APIs. pytest is test-only.
+1. **Stdlib only at runtime.** No Streamlit, FastAPI, NetworkX, requests, DB or
+   external APIs. pytest is test-only. The **one** permitted exception is M6's
+   optional `google-genai`, which lives in `requirements-gemini.txt`, is imported
+   inside `GeminiProvider.__init__` and is never needed by the engine, the mock
+   path or the test suite — a test asserts no module in `app/orchestration/`
+   imports an SDK at module scope.
 2. **Determinism.** Same seed → byte-identical scenario JSON; same input →
    identical `Route`. Tie-breaking is by node id; adjacency keeps insertion
    order. `scenarios/baseline.json` must stay byte-identical to
@@ -70,9 +86,10 @@ python -m app.cli.main rebalancing-demo --pods 100 --passengers 1000
 4. **Assumptions live in `app/config.py`** and the scenario file, not inside
    algorithms. No magic numbers in routing or graph code.
 5. **Layering:** models ← network ← routing ← simulation ← demand ← fleet ←
-   swarm ← rebalancing ← cli. Never import downward-to-upward: nothing below a
-   layer may import `app.demand`, `app.fleet`, `app.swarm` or `app.rebalancing`
-   (tests walk the lower layers to enforce all four).
+   swarm ← rebalancing ← orchestration ← cli. Never import downward-to-upward:
+   nothing below a layer may import `app.demand`, `app.fleet`, `app.swarm`,
+   `app.rebalancing` or `app.orchestration` (tests walk the lower layers to enforce
+   all five).
 6. **Typed errors only** (`app/errors.py`); the CLI turns them into one clean
    line on stderr with exit code 1 (no route) or 2 (invalid input).
 7. **Synthetic data must stay labelled as synthetic.** No real-world
@@ -132,7 +149,34 @@ python -m app.cli.main rebalancing-demo --pods 100 --passengers 1000
    values only — no graph, fleet, pod or simulation. Proposals are inert data,
    every settable parameter has explicit numeric bounds, and
    `apply_validated_action` accepts nothing but an already-validated action. The
-   AI must never mutate simulation state directly.
+   AI must never mutate simulation state directly. M6 honours this by **composing**
+   `observe()` rather than editing it: the whole M1-M5 engine is byte-for-byte
+   unchanged (verified by `git diff` against the M5 commit), and tests pin the
+   layering that keeps it so.
+17. **AI output is untrusted input, always.** It is parsed as data against a closed
+   schema and never executed, `eval`'d, imported, shelled out, written to a file or
+   used to name a module. `parse_action` uses `json.loads` on the whole response —
+   no fence stripping, no regex hunt for a JSON substring, no repair. Free-form AI
+   text is stripped of control characters and length-capped before it is stored or
+   printed. The four-member `AIActionType` enum is the whitelist, so a forbidden
+   action is rejected *structurally* rather than by a list someone must maintain.
+18. **The validator re-derives everything from the live engine.** It never trusts a
+   proposal's own account of the world, and it never mutates. Staleness is the
+   heart of it: an action carries the fingerprint of the observation it was reasoned
+   from, and `REJECT_STALE_OBSERVATION` stops a decision about one city state being
+   applied to another. `NO_ACTION` is the only exemption. Do not add a bypass, a
+   "trusted" provider, or a check that consults `confidence`.
+19. **M6 implements nothing the engine already does.** `REQUEST_REBALANCING` runs
+   M5's `apply_validated_action`; `RUN_SIMULATION` and `COMPARE_SCENARIOS` compose
+   existing constructors. The AI's `pod_count`/`target_nodes` are a **request**: M5's
+   planner decides every move, and the gap between asked and dispatched is reported
+   on every cycle, never smoothed. There is no second cost, congestion, battery or
+   forecasting model, and a test greps for one.
+20. **No secret, and no fake accuracy.** The API key is read from the environment,
+   handed to the SDK client and never stored, logged, printed, fingerprinted or put
+   in a prompt; `describe()` reports presence only. And there is deliberately **no
+   "AI accuracy" metric** — the heuristic it invokes is not claimed optimal, so
+   there is no ground truth. Count process; take outcomes from the engine.
 
 ## The M2 demand layer
 
@@ -229,13 +273,54 @@ The one edit M5 needed below itself was additive: `TripKind` on `Pod`, so a pod 
 be dispatched empty (`party_size=0`) and its arrivals counted apart from passenger
 arrivals. `PodStatus` is unchanged.
 
-## When starting M6
+## The M6 orchestration layer
 
-M6 is the orchestration layer and sits **above** everything. It must reach the
-engine only through `app/rebalancing/observation.py`: read state with `observe()`,
-emit a `ProposedAction`, have `ActionValidator` check it, and let
-`apply_validated_action` act. Do not give an LLM a reference to a graph, fleet,
-pod or simulation, and do not widen `PARAMETER_BOUNDS` without deciding what the
-new bound protects. Anything the validator accepts but M5 refuses to apply
-(scenario switching, comparisons) is M6's to implement — above the engine, not
-inside it. Build a new package; do not modify `app/rebalancing/`.
+`app/orchestration/` sits on top of `app/rebalancing/` and is organised as:
+
+| Module | Holds |
+|---|---|
+| `config.py` | every bound an approved proposal is held to, plus the mock's rules and `NO_ACCURACY_NOTE` |
+| `observation.py` | `OrchestrationObservation`, `build_observation`, `canonical_json`, `fingerprint_of` |
+| `actions.py` | `AIActionType` (the whitelist), `AIAction`, `ParsedAction`, `parse_action`, `clean_text` |
+| `validator.py` | `OrchestrationValidator`, `ValidationVerdict`, `Verdict`, every `REJECT_*` code |
+| `execution.py` | `ActionExecutor`, `ExecutionResult`, `ExecutionStatus` — mapping actions onto M5/M3 |
+| `scenarios.py` | `ScenarioSpec`, `run_scenario`, `build_simulation`, `EVALUATION_SCENARIOS` A/B/C |
+| `providers/` | `base.py` (the protocol), `mock.py` (`MockProvider`, `ScriptedProvider`), `gemini.py` |
+| `prompt.py` | `SYSTEM_PROMPT`, `RESPONSE_SCHEMA`, `build_user_payload` |
+| `orchestrator.py` | `Orchestrator.run_cycle` / `run_cycles` — the bounded loop |
+| `audit.py` | `OrchestrationRecord`, `AuditLog`, `cycle_id_for` |
+| `metrics.py` | `OrchestrationMetrics`, `compute_orchestration_metrics` |
+| `api.py` | the six pure-Python operations a future UI sits on |
+
+Things to know before changing anything:
+
+* **The loop is caller-driven.** `run_cycle` runs one cycle and returns; `run_cycles`
+  is capped by `max_cycles`. There is no background thread, no autonomous loop and no
+  automatic retry (`provider_max_attempts` is 1 — a failed call must not quietly
+  become three calls against a paid API).
+* **`advance_min` is the caller's, not the AI's, and its delta is a window rather
+  than an attribution.** A dispatched move changes nothing that instant, so measuring
+  an effect needs the engine advanced — but during those minutes the engine also runs
+  its own rebalancing cycles and ordinary service, so most of the delta is not the
+  AI's doing. The detail string says so; never let a report imply otherwise.
+* **Latency is the one non-deterministic number.** It lives on `record.timing()`,
+  outside `to_dict()`, so two identical runs produce byte-identical audit trails —
+  pinned by a test, including across processes.
+* **`expected_effect` and the engine's result are stored side by side, never merged.**
+  Collapsing them is how a system starts reporting an AI's intentions as results.
+* The mock provider is a **fixed rule, not a model**, and its choices say nothing
+  about what Gemini would do. Assert expectations against it only.
+* Evaluation scenarios A/B/C are tuned to genuinely pose their situations (a large
+  deficit; no deficit; a real deficit that is already too expensive to chase). If you
+  change fleet sizes or warm-up minutes, re-check that each still poses what it claims.
+
+## When starting the UI
+
+The dashboard is the next milestone and is **not started**. It must sit on
+`app/orchestration/api.py`'s six operations — `get_observation`, `propose_action`,
+`validate_action`, `execute_action`, `get_result`, `get_audit_log` — which already
+return JSON-serialisable plain values, so an HTTP adapter over them should carry no
+logic of its own. Do not reach past that façade into the engine, do not add a second
+validator, and do not let a UI control widen `PARAMETER_BOUNDS` or the orchestration
+bounds. Build a new package; do not modify `app/rebalancing/` or `app/orchestration/`
+beyond what the UI genuinely needs, and keep every invariant above.

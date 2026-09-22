@@ -1,4 +1,4 @@
-"""CLI for Milestones 1 through 5.
+"""CLI for Milestones 1 through 6.
 
 Examples:
     python -m app.cli.main route --from "North Station" --to "Airport"
@@ -12,6 +12,9 @@ Examples:
     python -m app.cli.main fleet-demo --pods 100 --passengers 1000
     python -m app.cli.main swarm-demo --pods 100 --passengers 1000
     python -m app.cli.main rebalancing-demo --pods 100 --passengers 1000
+    python -m app.cli.main ai-demo --provider mock
+    python -m app.cli.main ai-demo --provider mock --scenario B_NO_DEFICIT
+    python -m app.cli.main ai-demo --provider gemini      # needs $GEMINI_API_KEY
 
 Results go to stdout; logs and errors go to stderr. Exit codes: 0 ok,
 1 no route, 2 invalid input / scenario error.
@@ -55,6 +58,17 @@ from app.rebalancing import (
     build_demand_map,
     compute_rebalancing_metrics,
 )
+from app.orchestration import (
+    DEFAULT_ORCHESTRATION_CONFIG,
+    EVALUATION_SCENARIOS,
+    MockProvider,
+    Orchestrator,
+    ScenarioSpec,
+    build_simulation,
+    compute_orchestration_metrics,
+    evaluation_scenario,
+)
+from app.orchestration.providers import GeminiProvider, api_key_status
 from app.swarm import (
     DEFAULT_SWARM_CONFIG,
     SurplusDeficitRebalancer,
@@ -603,6 +617,175 @@ def cmd_rebalancing_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def _ai_simulation(args: argparse.Namespace):
+    """The city state the AI is asked about: a named evaluation scenario, or a custom one."""
+    if args.scenario in {s.name for s in EVALUATION_SCENARIOS}:
+        scenario = evaluation_scenario(args.scenario)
+        return scenario.prepared(), scenario
+    spec = ScenarioSpec(scenario_id="custom", profile_name=args.profile, pods=args.pods,
+                        passengers=args.passengers, fleet_seed=args.fleet_seed,
+                        demand_seed=args.demand_seed)
+    simulation = build_simulation(spec)
+    if args.at_min > 0:
+        simulation.run(until_min=args.at_min)
+    return simulation, None
+
+
+def _ai_provider(args: argparse.Namespace):
+    """Build the requested provider. Live mode fails here, clearly, if it is not configured."""
+    if args.provider == "mock":
+        return MockProvider(DEFAULT_ORCHESTRATION_CONFIG)
+    return GeminiProvider(DEFAULT_ORCHESTRATION_CONFIG, model=args.model)
+
+
+def cmd_ai_demo(args: argparse.Namespace) -> int:
+    """Observe, propose, validate, execute, report (M6).
+
+    Gemini is an orchestrator, not the simulation engine. Every number printed under
+    EXECUTION and RESULT comes from the deterministic M1-M5 engine; the AI's own words
+    appear only under PROPOSAL, and its "expected effect" is never presented as a result.
+    """
+    simulation, scenario = _ai_simulation(args)
+    provider = _ai_provider(args)
+    orchestrator = Orchestrator(provider, simulation=simulation,
+                                config=DEFAULT_ORCHESTRATION_CONFIG)
+
+    print(BANNER + "\n")
+    print("AI orchestration [SYNTHETIC — Gemini is an orchestrator, not the engine]")
+    print("-----------------------------------------------------------------------")
+    print("The AI proposes. A deterministic validator decides. The M1-M5 engine executes")
+    print("and alone produces every result below. No AI output is executed as code.")
+
+    status = api_key_status(DEFAULT_ORCHESTRATION_CONFIG)
+    described = provider.describe()
+    print(f"\nProvider: {described['provider']}"
+          + (f"  model: {described['model']}" if described.get("model") else "")
+          + f"   deterministic: {'YES' if described.get('deterministic') else 'NO'}")
+    print(f"Live Gemini configuration: ${status['api_key_env_var']} is "
+          f"{'set' if status['api_key_present'] else 'NOT set'}"
+          + ("" if status["api_key_present"] else " — mock mode needs no key"))
+
+    # ---- 1. the simulation state ------------------------------------------------
+    if scenario is not None:
+        print(f"\nEvaluation scenario: {scenario.name}")
+        print(f"  {scenario.description}")
+        print(f"  A reasonable operator would consider: {scenario.expected_consideration}")
+        print("  (recorded for reading, never asserted against a live model)")
+
+    observation = orchestrator.observe()
+    print(f"\nSIMULATION STATE at minute {observation.time_min:g}")
+    print(f"  Pods: {observation.fleet['pod_count']} "
+          f"({observation.fleet['idle_eligible_pods']} eligible to be repositioned)")
+    print(f"  Trips: {observation.demand['trip_count']} requested, "
+          f"{observation.metrics['rebalancing']['trips_served']} served, "
+          f"{observation.metrics['rebalancing']['unserved_trips']} unserved")
+    print(f"  Forecast deficit: {observation.demand['total_deficit']} pods across "
+          f"{observation.demand['deficit_node_count']} node(s)")
+    print(f"  Surplus: {observation.demand['total_surplus']} pods across "
+          f"{observation.demand['surplus_node_count']} node(s)")
+    print(f"  Average battery: {observation.fleet['average_battery_percent']}% "
+          f"(lowest {observation.fleet['minimum_battery_percent']}%)")
+    print(f"  Network: {observation.network['overloaded_edges']} overloaded edge(s), "
+          f"average load {observation.network['average_utilization_percent']}%")
+    print(f"  Swarms: {observation.swarm['active_swarm_count']} active, "
+          f"{observation.swarm['formation_count']} formed so far")
+    print(f"  Empty driving so far: "
+          f"{observation.metrics['rebalancing']['reposition_distance_km']} km "
+          f"({observation.metrics['rebalancing']['deadhead_share_percent']}% of all driving)")
+
+    print("\nOBSERVATION (what the AI is allowed to see)")
+    print(f"  Fingerprint: {observation.fingerprint()}")
+    print(f"  Sections: {', '.join(sorted(observation.to_dict()))}")
+    print("  Plain values only — no graph, fleet, pod or simulation is reachable from it.")
+    if args.show_observation:
+        import json as _json
+        print(_json.dumps(observation.to_dict(), indent=2, sort_keys=True))
+
+    # ---- 2-5. the bounded cycle(s) ----------------------------------------------
+    results = orchestrator.run_cycles(args.cycles, advance_min=args.advance_min)
+
+    for result in results:
+        record = result.record
+        print(f"\n{'=' * 71}")
+        print(f"CYCLE {record.cycle_id}")
+        print("=" * 71)
+        if record.provider_error:
+            print(f"\nPROVIDER FAILED: {record.provider_error}")
+            print("  The engine is untouched and still usable; nothing was validated or run.")
+            continue
+        if record.proposal is None:
+            print(f"\nPROPOSAL UNUSABLE: {record.parse_error_code}")
+            print(f"  {record.parse_error_detail}")
+            print("  The response did not fit the schema, so no action was formed. Nothing")
+            print("  was executed, and no part of the response was interpreted as code.")
+            continue
+
+        proposal = record.proposal
+        print(f"\nAI PROPOSAL ({record.provider})")
+        print(f"  Action: {proposal['action_type']}")
+        print(f"  Parameters: {proposal['parameters']}")
+        print(f"  Reason: {proposal['reason']}")
+        print(f"  Expected effect (the AI's words, NOT a result): "
+              f"{proposal['expected_effect']}")
+        print(f"  Confidence: {proposal['confidence']} — a number the model reported "
+              f"about itself; no check consults it")
+        print(f"  Observation fingerprint: {proposal['observation_fingerprint'][:16]}...")
+
+        print(f"\nVALIDATOR: {record.verdict}")
+        if record.reason_code:
+            print(f"  {record.reason_code}: {record.verdict_detail}")
+        passed = sum(1 for _, ok in record.checks if ok)
+        print(f"  {passed}/{len(record.checks)} check(s) passed:")
+        for name, ok in record.checks:
+            print(f"    [{'x' if ok else ' '}] {name}")
+
+        if record.execution is None:
+            print("\nEXECUTION: none — the action never reached the engine.")
+            continue
+        execution = record.execution
+        print(f"\nEXECUTION: {execution['status']}")
+        print(f"  {execution['detail']}")
+        for key in ("dispatched_count", "dispatched_to_requested_nodes",
+                    "rejected_by_engine", "total_deficit_before", "total_deficit_after"):
+            if key in execution["payload"]:
+                print(f"  {key}: {execution['payload'][key]}")
+        for move in execution["payload"].get("moves", [])[:args.examples]:
+            print(f"    {move['reposition_id']}  {move['pod_id']}  "
+                  f"{move['from_node_id']} -> {move['to_node_id']}  {move['reason']}  "
+                  f"{move['estimated_distance_km']} km")
+
+        if execution["status"] == "SKIPPED":
+            print("\nRESULT: the engine ran nothing, so there is no metrics delta to show.")
+            continue
+        print("\nRESULT (deterministic engine numbers, never the AI's)")
+        if execution["fingerprint_before"]:
+            print(f"  Fleet fingerprint: {execution['fingerprint_before'][:16]}... -> "
+                  f"{execution['fingerprint_after'][:16]}...")
+        for name, delta in sorted(execution["metrics_delta"].items()):
+            before = execution["metrics_before"].get(name)
+            after = execution["metrics_after"].get(name)
+            print(f"  {name:<32}{before!s:>14} -> {after!s:>14}  ({delta})")
+
+    # ---- 6. the audit trail ------------------------------------------------------
+    print(f"\n{'=' * 71}\nAUDIT TRAIL\n{'=' * 71}")
+    print(orchestrator.audit_log.explanation())
+    metrics = compute_orchestration_metrics(orchestrator.audit_log)
+    print("\nDecision-process metrics (process, not quality — see the note below)")
+    print(f"  Cycles: {metrics.cycles}   generated: {metrics.proposals_generated}   "
+          f"accepted: {metrics.proposals_accepted}   rejected: {metrics.proposals_rejected}")
+    print(f"  Stale: {metrics.stale_proposals}   malformed: {metrics.invalid_proposals}   "
+          f"provider failures: {metrics.provider_failures}")
+    print(f"  Executed: {metrics.successful_actions}   no-action: {metrics.no_action_count}   "
+          f"execution failures: {metrics.execution_failures}")
+    print(f"  Action types: {dict(metrics.action_type_counts)}")
+    print(f"  Average provider latency: {metrics.average_latency_ms} ms "
+          f"(wall-clock; not deterministic, not fingerprinted)")
+    print(f"\n  {metrics.accuracy_note}")
+    print(f"\nAudit fingerprint: {orchestrator.audit_log.fingerprint()}")
+    print(f"Fleet fingerprint: {simulation.snapshot().fingerprint()}")
+    return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     text = dump_scenario(generate_synthetic_city_dict(args.seed))
     if args.output == "-":
@@ -715,6 +898,35 @@ def build_parser() -> argparse.ArgumentParser:
     rebal.add_argument("--algorithm", choices=["astar", "dijkstra"], default="astar")
     add_source(rebal)
     rebal.set_defaults(func=cmd_rebalancing_demo)
+
+    ai = sub.add_parser("ai-demo",
+                        help="observe, propose, validate, execute and report one "
+                             "bounded AI orchestration cycle")
+    ai.add_argument("--provider", choices=["mock", "gemini"], default="mock",
+                    help="mock needs no API key and is deterministic; gemini needs "
+                         "$GEMINI_API_KEY")
+    ai.add_argument("--model", default=None,
+                    help="Gemini model id (default: $GEMINI_MODEL, else the configured one)")
+    ai.add_argument("--scenario", default="A_LARGE_DEFICIT",
+                    help="an evaluation scenario (A_LARGE_DEFICIT, B_NO_DEFICIT, "
+                         "C_EXPENSIVE) or 'custom' to use --pods/--passengers/--at-min")
+    ai.add_argument("--profile", default="baseline",
+                    help="demand profile for --scenario custom")
+    ai.add_argument("--pods", type=int, default=60)
+    ai.add_argument("--passengers", type=int, default=400)
+    ai.add_argument("--at-min", type=float, default=420.0,
+                    help="minute to advance a custom scenario to before observing")
+    ai.add_argument("--fleet-seed", type=int, default=DEFAULT_FLEET_SEED)
+    ai.add_argument("--demand-seed", type=int, default=DEFAULT_DEMAND_SEED)
+    ai.add_argument("--cycles", type=int, default=1,
+                    help="how many bounded cycles to run; the caller drives the loop")
+    ai.add_argument("--advance-min", type=float, default=None,
+                    help="minutes to advance the engine after an executed action, so its "
+                         "effect has time to show up in the metrics")
+    ai.add_argument("--examples", type=int, default=3)
+    ai.add_argument("--show-observation", action="store_true",
+                    help="print the full observation the AI was given, as JSON")
+    ai.set_defaults(func=cmd_ai_demo)
 
     export = sub.add_parser("export-scenario", help="write the synthetic city as scenario JSON")
     export.add_argument("--seed", type=int, default=DEFAULT_SEED)

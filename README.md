@@ -1,7 +1,12 @@
-# Modular Swarm Network — Milestones 1 through 5
+# Modular Swarm Network — Milestones 1 through 6
 
 **A fully deterministic city, demand, fleet, platooning and adaptive-rebalancing
-simulation. No machine learning and no LLM anywhere in it.**
+simulation (M1-M5), plus an AI orchestration layer that can only propose bounded
+actions to it (M6).**
+
+There is no machine learning and no LLM anywhere in the engine. M6 adds an optional
+orchestrator *above* it — **Gemini is an orchestrator, not the simulation engine**
+(§12) — and the engine runs exactly as before with no provider at all.
 
 > ⚠️ **All data in this milestone is SYNTHETIC.** The city, coordinates, distances,
 > capacities and traffic counts are invented. Nothing here claims real-world
@@ -34,12 +39,17 @@ It provides validated node/edge models, a directed weighted graph with dynamic
 routing with a proven-admissible heuristic, a seeded synthetic city, a
 human-readable scenario file, a minimal simulation state, and a CLI.
 
-## 2. What M1-M5 deliberately do NOT do
+## 2. What this project deliberately does NOT do
 
-No magnetic linking, no Gemini / LLM / agents / orchestration, no dashboard or
-animation, no route caching, no real map data, no cloud services. M5 defines the
-boundary a future orchestrator would sit above (§11) but implements no orchestrator.
-The runtime uses **only the Python standard library** and works fully offline.
+No magnetic linking, no dashboard or animation, no route caching, no real map data,
+no cloud services, no autonomous agents and no arbitrary code execution. **The
+engine (M1-M5) contains no AI of any kind**: M5 defines the boundary an orchestrator
+sits above (§11), and M6 sits above it (§12) without changing a line of it.
+
+The runtime uses **only the Python standard library** and works fully offline. That
+is still true with M6 installed: the Google GenAI SDK is an optional extra
+(`requirements-gemini.txt`), imported inside `GeminiProvider.__init__`, and neither
+the engine nor the test suite ever needs it or an API key.
 
 ## 3. Architecture
 
@@ -48,6 +58,14 @@ The runtime uses **only the Python standard library** and works fully offline.
                  │  app/cli/main.py  (argparse)│   stdout = results, stderr = logs/errors
                  └──────────────┬─────────────┘
                                 │
+          ┌─────────────────────▼─────────────────────┐
+          │ app/orchestration/  (M6)                  │  observe -> propose ->
+          │  config.py  observation.py  actions.py    │  validate -> execute -> record
+          │  validator.py  execution.py  scenarios.py │  the AI proposes only; it
+          │  orchestrator.py  audit.py  metrics.py    │  never mutates the engine
+          │  prompt.py  api.py  providers/            │  mock (default) | gemini
+          └─────────────────────┬─────────────────────┘
+                                │  reaches the engine ONLY through the boundary below
           ┌─────────────────────▼─────────────────────┐
           │ app/rebalancing/  (M5)                    │  forecast, demand map,
           │  config.py  forecast.py  demand_map.py    │  eligibility, matching,
@@ -942,7 +960,357 @@ because deciding *when* to switch scenario or run a comparison is orchestration 
 **M6's job, and deliberately absent here. There is no Gemini, no LLM and no agent
 in this milestone.**
 
-## 12. How to run
+## 12. AI orchestration (M6)
+
+> ⚠️ **Gemini is an orchestrator, not the simulation engine.** Every number this
+> section reports is produced by the deterministic M1–M5 engine. The AI chooses
+> *which question to ask*; it never computes an answer, and it never changes
+> simulation state.
+
+M1–M5 are the deterministic source of truth and were **not modified by M6**: the
+whole engine — `app/models/`, `app/network/`, `app/routing/`, `app/simulation/`,
+`app/demand/`, `app/fleet/`, `app/swarm/`, `app/rebalancing/`, `app/config.py` and
+every scenario file — is byte-for-byte identical to the M5 commit (`git diff` against
+it is empty). Tests pin what keeps it that way: no module below M6 mentions
+`app.orchestration`, M6 uses M5's published boundary exactly as it stands without
+widening its action vocabulary, and M6 introduces no second cost, congestion,
+battery or forecasting model. M6 is a new package, `app/orchestration/`, above
+everything.
+
+### 12.1 The architecture, and why it is shaped this way
+
+```
+                        GEMINI  (or the deterministic mock)
+                          │  sees a frozen tree of plain values
+                          ▼
+                     PROPOSAL          action_type, parameters, reason,
+                          │            expected_effect, confidence,
+                          │            observation_fingerprint
+                          ▼
+                     VALIDATOR         deterministic; re-derives every fact
+                          │            from the live engine; APPROVED / REJECTED
+                          ▼
+              DETERMINISTIC SIMULATION  M1-M5, unchanged
+                          │
+                          ▼
+                       RESULT           the engine's numbers, never the AI's
+                          │
+                          ▼
+                     AUDIT LOG          what was seen, proposed, decided, done
+```
+
+The shape is the point. A language model is a useful reader of a messy situation and
+an unreliable executor of anything. So it is given a *read-only* picture and a
+*closed* vocabulary, and everything it says is treated as untrusted input: parsed as
+data, checked against the engine, and only then acted on — by the engine, using code
+that already existed and was already tested.
+
+| | Gemini | The deterministic engine |
+|---|---|---|
+| Interprets the situation | ✅ | |
+| Prioritises what matters | ✅ | |
+| Reasons about trade-offs | ✅ | |
+| Proposes a bounded action | ✅ | |
+| Explains a decision in prose | ✅ | |
+| Routing, congestion, demand | | ✅ |
+| Pod movement, swarms, battery | | ✅ |
+| Rebalancing feasibility | | ✅ |
+| Validation and execution | | ✅ |
+| Every metric | | ✅ |
+
+### 12.2 The observation — the AI's only input
+
+`app/orchestration/observation.py` composes M5's `observe()` and adds read-only
+derived detail. What comes out is a frozen tree of plain values: no graph, no fleet,
+no pod, no swarm, no simulation, no callable, no secret. A caller holding one
+**cannot** mutate anything through it, which is what makes the boundary structural
+rather than a matter of politeness.
+
+| Section | Holds |
+|---|---|
+| `network` | node/edge counts, overloaded edges, average load, the most congested edges |
+| `demand` | trips requested and their statuses, total deficit and surplus, the worst deficit and surplus nodes |
+| `fleet` | pod count, status counts, capacity, battery distribution, pods per node, how many pods are eligible to move and why the rest are not |
+| `swarm` | active swarms, sizes, shared corridors, formations and splits so far |
+| `forecast` | horizon, upcoming bucket, whether there is enough history, per-node forecasts |
+| `rebalancing` | cycles run, moves in flight, reposition statuses |
+| `metrics` | M3 fleet, M4 swarm (including the `*_equiv_km` road-space figures) and M5 rebalancing metrics |
+| `engine_fingerprints` | the fleet and swarm snapshot fingerprints |
+
+Determinism is enforced, not hoped for: every collection is built by walking a sorted
+sequence, every float is rounded to a fixed number of decimals, the only clock is the
+simulation's own `time_min`, and no object identity, `repr` or Python `hash()`
+appears anywhere. `fingerprint()` is the SHA-256 of the canonical JSON form and is
+identical across processes and `PYTHONHASHSEED` values.
+
+```
+minute 420.0: forecast deficit 26.0408 pods across 12 node(s), worst at residential_south
+fingerprint: 4d69876696c3a20ab199ef3799714cd203fa6aa4f6b95b42b529c0d4923e60a7
+```
+
+### 12.3 The action schema and the whitelist
+
+```json
+{
+  "action_type": "REQUEST_REBALANCING",
+  "parameters": {"target_nodes": ["residential_south", "riverside"], "pod_count": 11},
+  "reason": "Forecast deficit of 26.0408 pods across 12 node(s), worst at residential_south.",
+  "expected_effect": "Ask the deterministic rebalancer to run a cycle toward those nodes.",
+  "confidence": 0.95,
+  "observation_fingerprint": "4d69876696c3a20a..."
+}
+```
+
+Exactly four actions exist — `REQUEST_REBALANCING`, `RUN_SIMULATION`,
+`COMPARE_SCENARIOS`, `NO_ACTION` — and they are the members of a Python enum, so
+`EXECUTE_CODE`, `RUN_SHELL`, `MODIFY_FILE`, `CHANGE_CONGESTION_FORMULA`, `DELETE_POD`
+and `DIRECTLY_MUTATE_STATE` are rejected *structurally*, not by a blacklist someone
+has to remember to update:
+
+```
+unknown_action_type: 'EXECUTE_CODE' is not one of REQUEST_REBALANCING,
+RUN_SIMULATION, COMPARE_SCENARIOS, NO_ACTION
+```
+
+Two details worth stating plainly. `expected_effect` is **the model's words, not a
+result** — it is stored beside the engine's actual outcome and never merged with it.
+And `confidence` is a number the model reports about itself; it is not a probability
+of being right, and **no check consults it**.
+
+Parsing is strict. A structured (schema-constrained) response is used as-is; a text
+response is parsed **whole** with `json.loads`. There is no fence-stripping, no regex
+hunt for a JSON-looking substring and no repair, because salvaging a fragment is
+precisely how partially-understood output gets executed. Prose produces
+`AI_OUTPUT_INVALID`, no action, and an audit record holding the raw text:
+
+```
+AI_OUTPUT_INVALID | response is not valid JSON: Expecting value: line 1 column 1 (char 0)
+```
+
+### 12.4 Validation, including stale-state protection
+
+The validator re-derives every fact from the live engine — it never takes the AI's
+word for anything, including what the AI claims to have seen. For
+`REQUEST_REBALANCING` it runs fifteen named checks in order, and the list is stored
+in the audit record so a rejection explains exactly which gate closed (`ai-demo`
+prints one per line; two columns here for space, read down the left first):
+
+```
+VALIDATOR: APPROVED
+  15/15 check(s) passed:
+    [x] action_type_whitelisted                     [x] pod_count_present
+    [x] parameter_keys_allowed                      [x] pod_count_is_a_whole_number
+    [x] observation_is_current                      [x] pod_count_within_bounds
+    [x] target_nodes_present                        [x] rebalancing_is_enabled
+    [x] target_nodes_is_a_list_of_strings           [x] enough_eligible_pods
+    [x] target_node_count_within_bound              [x] some_eligible_pod_clears_the_battery_reserve
+    [x] target_nodes_are_distinct                   [x] below_concurrent_reposition_limit
+    [x] target_nodes_exist
+```
+
+`enough_eligible_pods` applies **M5's eligibility rule unchanged**: idle, not
+charging, not in an active swarm. A passenger's pod is never the AI's to move.
+
+**Stale observation protection.** Every action carries the fingerprint of the
+observation it was reasoned from. Before approving, the validator builds a fresh
+observation of the simulation *as it is now* and compares:
+
+```
+REJECT_STALE_OBSERVATION | action was reasoned from 000000000000...,
+                           the simulation is now 4d69876696c3...
+```
+
+The fingerprint moves the instant anything material changes, so a decision made about
+one city state can never be applied to another. `NO_ACTION` is the one exemption, and
+only `NO_ACTION`: doing nothing is safe in every state.
+
+### 12.5 Execution — no second implementation of anything
+
+| Action | Runs |
+|---|---|
+| `REQUEST_REBALANCING` | M5's own boundary: a `ProposedAction` through M5's `ActionValidator` and `apply_validated_action`, which runs one deterministic rebalancing cycle |
+| `RUN_SIMULATION` | `run_scenario`, a composition of `build_synthetic_city`, `generate_fleet`, `generate_demand` and `RebalancingSimulation` |
+| `COMPARE_SCENARIOS` | the same runner, once per named scenario, tabulated side by side |
+| `NO_ACTION` | nothing. Reported as `SKIPPED`, not as a failure |
+
+Note carefully what `REQUEST_REBALANCING` does **not** do. The AI names target nodes
+and a pod count; M5's planner then decides which pods actually move, using its own
+forecast, surplus rule, distance limit and battery reserve. The AI's numbers are
+recorded as its *request*, and the result reports what the engine actually did
+alongside them:
+
+```
+The deterministic rebalancer ran one cycle: 1 move(s) dispatched, 6 refused by the
+engine's own rules. The AI asked for 11 pod(s) toward 5 node(s); 1 dispatched move(s)
+target a node it named. The planner, not the AI, chose every move.
+```
+
+**One dispatched out of eleven requested.** That gap is the architecture working, and
+it is reported as it falls rather than smoothed over. An AI that asks for eleven pods
+has not moved eleven pods; it has asked a planner that moved one.
+
+### 12.6 A worked cycle, honestly reported
+
+Evaluation scenario A (20 pods, 800 passengers, minute 420), one cycle with the
+caller then advancing the engine 60 minutes:
+
+```
+The deterministic rebalancer ran one cycle: 1 move(s) dispatched, 6 refused.
+The caller then advanced the engine 60 minutes.
+```
+
+| Metric | before | after | delta |
+|---|---:|---:|---:|
+| trips served | 55 | 75 | **+20** |
+| trips not yet completed | 745 | 725 | −20 |
+| completed repositions | 18 | 21 | +3 |
+| deadhead distance (km) | 215.97 | 259.66 | **+43.69** |
+| deadhead energy (kWh) | 38.944 | 46.830 | +7.886 |
+| pod distance, all (km) | 1 067.154 | 1 522.304 | +455.15 |
+| forecast deficit | 26.0408 | 34.0962 | **+8.0554** |
+| average wait (min) | 9.39 | 11.45 | **+2.06** |
+| average completion (min) | 30.01 | 33.30 | **+3.29** |
+
+Three things must be said about this table rather than left for a careful reader to
+notice.
+
+**It is not attribution.** The delta covers a 60-minute window during which the
+engine also ran its *own* rebalancing cycles on its normal cadence, served whatever
+trips arrived, and charged whatever pods needed it. One AI-requested cycle dispatched
+one move. Almost none of the +20 trips or the +43.69 deadhead km belongs to it. The
+record reports the window the caller asked for; it does not claim the AI caused it,
+and §12.10 explains why no metric here pretends to.
+
+**"Not yet completed" is not "refused".** This run holds all 800 trip records from the
+start, with request times out to minute 1 439, so at minute 420 most of the 745 simply
+have not been asked for yet. The figure is M3's, reported with its own meaning intact.
+
+**Three numbers got worse.** The forecast deficit rose, and so did both wait and
+completion time. Demand in this scenario arrives faster than 20 pods can serve it, so
+the queue grows whatever anyone proposes. The figures are printed unnetted in both
+directions, because a layer that only showed its wins would be worth nothing.
+
+### 12.7 Providers
+
+| Provider | Needs a key | Deterministic | Notes |
+|---|---|---|---|
+| `MockProvider` | no | **yes** | fixed arithmetic rules; the default, and what every test uses |
+| `ScriptedProvider` | no | yes | a test double that replays prepared responses or fails on cue |
+| `GeminiProvider` | yes | no | the Google GenAI SDK, imported *inside* the constructor |
+
+The mock is a **fixed rule, not a model**, and it is not a prediction of what Gemini
+would choose. Its rules, in order: a deficit below the threshold → `NO_ACTION`; no
+eligible pod → `NO_ACTION`; deadhead already above 40 % of all driving → `NO_ACTION`;
+otherwise `REQUEST_REBALANCING` toward the worst deficit nodes. The third rule is the
+one worth reading twice — a real shortfall is *not* on its own a reason to spend more
+empty kilometres.
+
+**Credentials.** The API key is read from `$GEMINI_API_KEY` at construction time,
+handed straight to the SDK client, and never stored on the instance, written to an
+audit record, printed, logged or placed in a prompt. `describe()` reports whether a
+key was present, never what it was. Live mode without one fails immediately:
+
+```
+error: live Gemini mode needs an API key in $GEMINI_API_KEY, which is unset or
+empty. Use --provider mock to run without one.
+```
+
+`provider_max_attempts` is 1: a failed call fails, rather than quietly becoming three
+calls against a paid API.
+
+### 12.8 Failure handling
+
+Every stage can end a cycle, and each ends it with a complete audit record and an
+untouched engine:
+
+| Failure | What happens |
+|---|---|
+| missing API key | `ProviderConfigurationError` naming the variable; mock mode still works |
+| SDK not installed | `ProviderConfigurationError` pointing at `requirements-gemini.txt` |
+| API timeout or provider error | recorded as `PROVIDER_FAILED`; nothing is validated or run |
+| malformed or prose response | `AI_OUTPUT_INVALID`; no action is formed |
+| action outside the whitelist | cannot be constructed; recorded as unusable output |
+| stale observation | `REJECT_STALE_OBSERVATION` |
+| invented node, bad pod count, unknown scenario | rejected with a named reason code |
+| not enough eligible pods, or too little battery | rejected using M5's own rules |
+| the engine refusing an approved action | recorded as `FAILED` with the error type; the engine stays valid |
+
+A test asserts that after a provider failure the simulation still ticks and a later
+cycle still works. **If Gemini is missing, slow, broken or wrong, the simulation is
+unaffected.**
+
+### 12.9 The audit trail
+
+One record per cycle, appended in order, never rewritten. Between them the records
+answer the four questions that make an AI-in-the-loop system reviewable:
+
+```
+CY00001  provider=mock
+  OBSERVED    minute 420.0: forecast deficit 26.0408 pods across 12 node(s),
+              worst at residential_south
+  PROPOSAL    REQUEST_REBALANCING (confidence 0.95)
+  REASONING   Forecast deficit of 26.0408 pods across 12 node(s), worst at
+              residential_south, against 11 eligible pod(s).
+  AI EXPECTS  Ask the deterministic rebalancer to run a cycle toward those nodes.
+              The engine decides which pods, if any, actually move.
+  VALIDATOR   APPROVED
+  ENGINE DID  EXECUTED: 1 move(s) dispatched, 6 refused by the engine's own rules.
+```
+
+`AI EXPECTS` and `ENGINE DID` are stored separately and never merged — collapsing
+them is exactly how a system starts reporting an AI's intentions as results. The
+record holds no wall-clock time (latency lives on `timing()`, outside the
+deterministic record), so two identical runs produce byte-identical trails; a test
+checks that across separate processes.
+
+### 12.10 Decision-quality metrics
+
+Measured: proposals generated, accepted, rejected, stale, malformed; provider
+failures; executed and failed actions; which action types were chosen; and average
+provider latency, flagged everywhere as wall-clock and excluded from every
+fingerprint.
+
+**There is deliberately no "AI accuracy" metric.** Accuracy needs a ground truth, and
+there is none: the rebalancing heuristic the AI is proposing to invoke is itself
+explicitly not claimed to be optimal (§11), so there is no right answer for a
+proposal to match. Inventing a percentage anyway would be the one genuinely dishonest
+number this project could produce. What is measured is *process*; what is compared,
+when decisions are compared, is the deterministic engine's *outcome* on the same
+scenario, with the methodology stated.
+
+### 12.11 Evaluation scenarios
+
+| Scenario | The situation | Consideration | Mock chose |
+|---|---|---|---|
+| `A_LARGE_DEFICIT` | 20 pods, 800 passengers, minute 420: ~26 pods short across 12 nodes, 20 % of driving empty so far | rebalancing | `REQUEST_REBALANCING` |
+| `B_NO_DEFICIT` | 120 pods, 40 passengers, minute 240: forecast demand met everywhere | `NO_ACTION` | `NO_ACTION` |
+| `C_EXPENSIVE` | 110 pods, 250 passengers, minute 560: a real ~4-pod deficit, but 48.6 % of all driving is already empty | `NO_ACTION` or something smaller | `NO_ACTION` |
+
+The expected consideration is asserted **only against the mock**, whose rules are
+fixed and reviewable. A live model's output is recorded for reading and never
+asserted: a test suite that demands a particular sentence from a language model is
+testing the weather.
+
+### 12.12 The API boundary for a future UI
+
+`app/orchestration/api.py` is pure Python — no HTTP, no framework, no server — and
+exposes exactly what a front end needs: `get_observation`, `propose_action`,
+`validate_action`, `execute_action`, `get_result`, `get_audit_log`. Everything in and
+out is JSON-serialisable plain values, so an HTTP adapter over it would be a
+translation layer with no logic of its own. **The dashboard is not built in this
+milestone.**
+
+### 12.13 Security
+
+Never: expose, log or store an API key; execute AI text as code; run a shell command
+from AI output; modify a file from AI output; import a module an AI named; let an AI
+change a validation rule. All external AI output is untrusted input, and the tests
+include hostile payloads — terminal escape sequences in a reason string, an
+`EXECUTE_CODE` action, `__import__('os').system(...)` as a response body — each of
+which is refused as data without ever being interpreted.
+
+
+## 13. How to run
 
 Python 3.11+. No installation is needed for the runtime.
 
@@ -1011,10 +1379,32 @@ moves it made with their reasons and priorities, the state **after**, and a
 no-rebalancing vs adaptive comparison that includes every deadhead kilometre and
 both wait figures.
 
+```bash
+# M6 — AI orchestration (mock mode needs no API key and no third-party package)
+python -m app.cli.main ai-demo --provider mock
+python -m app.cli.main ai-demo --provider mock --scenario B_NO_DEFICIT
+python -m app.cli.main ai-demo --provider mock --scenario C_EXPENSIVE
+python -m app.cli.main ai-demo --provider mock --cycles 3 --advance-min 30
+python -m app.cli.main ai-demo --provider mock --scenario custom --pods 40 --passengers 300 --at-min 300
+python -m app.cli.main ai-demo --provider mock --show-observation      # the full AI input, as JSON
+
+# live mode — needs the optional SDK and a key, and is never needed for tests
+pip install -r requirements-gemini.txt
+export GEMINI_API_KEY=...          # never committed, never logged, never in a prompt
+python -m app.cli.main ai-demo --provider gemini
+```
+
+`ai-demo` prints the simulation state, the observation and its fingerprint, the AI's
+proposal (clearly labelled as the AI's words), every validator check with its
+verdict, what the **engine** actually did, the metrics before and after, the audit
+trail and the decision-process metrics. Without `$GEMINI_API_KEY` it says so plainly
+and mock mode carries on; `--provider gemini` without a key exits `2` with one clean
+line naming the variable.
+
 Exit codes: `0` success, `1` no route, `2` invalid input or scenario,
 `3` A*/Dijkstra cost mismatch (should never happen).
 
-## 13. How to run tests
+## 14. How to run tests
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -1022,9 +1412,10 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-562 test functions (772 cases with parametrization) across models, network,
+723 test functions (981 cases with parametrization) across models, network,
 routing, determinism, edge cases, route-switch regression, and the M2 demand,
-M3 fleet, M4 swarm and M5 rebalancing layers. Highlights: A* and Dijkstra costs match for **all 462 ordered node
+M3 fleet, M4 swarm, M5 rebalancing and M6 orchestration layers. **No test needs
+an API key, a network connection or the Gemini SDK.** Highlights: A* and Dijkstra costs match for **all 462 ordered node
 pairs**, and again under random congestion; the heuristic is checked for
 admissibility against true costs from every node to every goal.
 
@@ -1099,6 +1490,36 @@ rejects out-of-range and unknown parameters. Further tests assert that
 `PodStatus` still has five members, that `TripKind` defaults to passenger, and that
 no lower layer imports `app.rebalancing`.
 
+M6 contributes 161 test functions (209 cases) across five files. The observation is
+checked for determinism, for a stable fingerprint, for surviving a JSON round trip,
+for holding **plain values only** (a walker asserts no graph, fleet, pod, swarm,
+simulation or callable is reachable), for carrying no wall clock, for changing
+nothing in the engine, for stable ordering, and for agreeing across separate
+processes under three `PYTHONHASHSEED` values. The schema tests cover the four-member
+whitelist and ten forbidden action names, every malformed field, control-character
+stripping and length capping of untrusted text, and the refusal to mine JSON out of
+prose or out of a fenced code block. The validator tests walk every gate — stale
+observation (and the `NO_ACTION` exemption), invented, repeated and over-many nodes,
+pod-count type and bounds, insufficient eligible pods, insufficient battery,
+rebalancing disabled, the concurrency limit, unknown and duplicated scenarios, an
+oversized comparison, out-of-range horizons and run sizes — and assert that
+validating changes nothing. The provider tests cover the mock's determinism
+(including a separate-process replay), each of its three decision rules, the scripted
+double's failure path, the system prompt's contents, and the Gemini provider's
+configuration: a missing or blank key, the lazy SDK import, a schema-constrained
+request shape through an injected stub client, prose and empty responses, the absence
+of a retry loop, and that **no credential appears in `describe()`, `repr()`, the
+instance, the prompt or the audit log**. The cycle tests run the loop end to end,
+break it at every stage (provider failure, malformed response, forbidden action,
+stale proposal, engine refusal), assert that executing a rejected verdict *raises*,
+that `REQUEST_REBALANCING` goes through M5's own `apply_validated_action` rather than
+a second rebalancer, that two identical runs produce byte-identical audit trails in
+the same process and in another one, that there is no accuracy metric, and that the
+`ai-demo` CLI works with no key and exits cleanly without one in live mode. Further
+tests assert that no lower layer imports `app.orchestration`, that no module in M6
+imports an SDK at module scope, that `app/rebalancing/` was not modified, and that M6
+introduces no second cost or congestion model.
+
 `tests/test_route_switch_regression.py` (M1.1) pins the end-to-end behaviour that
 congestion can change the chosen route. On the seed-42 baseline,
 North Station -> East Hub is normally `E009 -> E011` via Northgate Junction
@@ -1110,7 +1531,7 @@ route is genuinely cheaper under the modified costs, that Dijkstra and A* still
 agree before/after/restored, that repeated executions are bit-identical, and that
 restoring the original traffic restores the original route and cost exactly.
 
-## 14. Known limitations
+## 15. Known limitations
 
 * Synthetic data only; no calibration against real traffic.
 * Vehicle counts are static inputs — there is no traffic propagation, queueing,
@@ -1222,7 +1643,36 @@ M5 rebalancing:
 * The deadhead energy is M3's approximated battery model, and a repositioning pod
   earns nothing for the charge it spends.
 
-## 15. Future milestones
+M6 orchestration:
+
+* **The AI's `pod_count` and `target_nodes` are a request, not a command.** An
+  approved `REQUEST_REBALANCING` authorises one deterministic rebalancing cycle;
+  M5's planner then decides every move on its own rules. In the worked example
+  eleven pods were asked for and one was dispatched. That is the design, but it does
+  mean the AI has less leverage than the schema suggests, and the gap is reported on
+  every cycle rather than smoothed over.
+* **The mock provider is a fixed rule, not a model.** It exists so the whole path is
+  testable without a key. Its choices say nothing about what Gemini would choose, and
+  no test asserts anything about a live model.
+* **No live Gemini run is included here.** `$GEMINI_API_KEY` was not available in the
+  environment this milestone was built in, so every claim in §12 was verified through
+  the mock and scripted providers and an injected stub client. The live path's request
+  shape, response handling and failure modes are covered; an actual API call is not.
+* **Nothing measures whether a proposal was good.** Process is counted; outcome comes
+  from the engine. There is no accuracy figure, by choice (§12.10).
+* A cycle sees one instant. There is no memory between cycles beyond the audit log,
+  so the orchestrator cannot notice that its last three proposals achieved nothing.
+* `expected_effect` and `confidence` are stored and printed but never acted on. A
+  confident wrong proposal is treated exactly like a hesitant one.
+* The observation is a summary. A model cannot ask a follow-up question, inspect an
+  individual pod, or request a different slice — it sees the fixed sections in §12.2
+  and nothing else.
+* Only `REQUEST_REBALANCING` touches the live simulation. `RUN_SIMULATION` and
+  `COMPARE_SCENARIOS` start fresh deterministic runs and leave the current one alone.
+* There is no UI. §12.12 is the interface a UI would sit on; the dashboard is not
+  built.
+
+## 16. Future milestones
 
 * **M1** — deterministic city + network foundation ✅
 * **M1.1** — route-switch regression validation ✅
@@ -1231,14 +1681,16 @@ M5 rebalancing:
 * **M4** — deterministic swarm formation and platooning ✅
 * **M4.1** — swarm metric semantics audit ✅
 * **M5** — adaptive fleet rebalancing and the M6 boundary ✅
-* **M6** — AI orchestration layer (next; not started)
-* Later — dashboard, impact comparison.
+* **M6** — Gemini orchestration and validated AI control ✅
+* Later — the visual dashboard, and impact comparison on top of §12.12's API.
 
-**M5 completes the deterministic engine.** Everything up to here is reproducible
-from a seed, uses only the Python standard library, and runs offline. M6 would sit
-*above* it as an orchestrator, observing through §11's read-only snapshot and
-proposing bounded actions that the validator checks before the engine acts — it can
-never mutate simulation state directly.
+**M5 completes the deterministic engine; M6 adds the only thing above it.**
+Everything through M5 is reproducible from a seed, uses only the Python standard
+library, and runs offline — and all of that is still true with M6 in place. The
+orchestrator observes through a read-only snapshot and proposes bounded actions that
+a deterministic validator checks before the engine acts. It cannot mutate simulation
+state, cannot widen its own bounds, and cannot execute anything. **Gemini is an
+orchestrator, not the simulation engine.**
 
 The pipeline is `passenger demand → trip requests → routing → pod grouping → swarm
 formation`, with rebalancing closing the loop back to demand. M1–M5 implement all of
