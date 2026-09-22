@@ -386,7 +386,10 @@ def cmd_swarm_demo(args: argparse.Namespace) -> int:
         ("trips completed", base_fleet_m.completed_trips, swarm_fleet_m.completed_trips),
         ("pod distance driven (km)", base_fleet_m.total_distance_km, swarm_fleet_m.total_distance_km),
         ("energy used (kWh)", base_fleet_m.total_energy_kwh, swarm_fleet_m.total_energy_kwh),
-        ("road occupancy (km, est.)", base_m.road_occupancy_km, swarm_m.road_occupancy_km),
+        ("road occupancy (equiv-km, est.)", base_m.road_occupancy_equiv_km,
+         swarm_m.road_occupancy_equiv_km),
+        ("road occupancy saving (%)", base_m.road_occupancy_saving_percent,
+         swarm_m.road_occupancy_saving_percent),
         ("shared corridor (km)", base_m.total_shared_corridor_distance_km,
          swarm_m.total_shared_corridor_distance_km),
         ("avg wait before pickup (min)", base_fleet_m.average_trip_wait_time_min,
@@ -397,13 +400,22 @@ def cmd_swarm_demo(args: argparse.Namespace) -> int:
     for label, left, right in rows:
         print(f"  {label:<34}{left!s:>13}{right!s:>13}")
 
-    print(f"\n  Estimated road space freed by coordination: "
-          f"{swarm_m.coordination_benefit_km} km "
-          f"({swarm_m.road_occupancy_saving_percent}% of pod-km)")
-    print(f"  Assumption: a following pod in formation needs "
-          f"{swarm_config.formation_occupancy_factor:.0%} of an independent pod's road space.")
-    print("  This is a ROAD-SPACE estimate only. Pod distance, travel time and energy are")
-    print("  unchanged by platooning above — no fuel, energy or emissions saving is claimed.")
+    served_delta = swarm_fleet_m.completed_trips - base_fleet_m.completed_trips
+    print("\n  Reading the table: the two runs did NOT serve the same trips "
+          f"({served_delta:+d} in swarm mode),")
+    print("  because waiting to form shifts departures. Distance and energy totals move with")
+    print("  the served set, so only the scale-free saving (%) row compares the two directly.")
+
+    print(f"\n  Estimated road space freed by coordination, within the swarm run: "
+          f"{swarm_m.road_occupancy_saved_equiv_km} equiv-km")
+    print(f"    = pod distance {swarm_m.pod_distance_km} km "
+          f"- road occupancy {swarm_m.road_occupancy_equiv_km} equiv-km "
+          f"({swarm_m.road_occupancy_saving_percent}% of its pod-km)")
+    print(f"  equiv-km is single-pod-equivalent ROAD SPACE, not distance: one pod driving alone")
+    print(f"  for 1 km is 1.0 equiv-km, and a pod following in formation is charged "
+          f"{swarm_config.formation_occupancy_factor:.0%} of that.")
+    print("  Pod distance, travel time and energy are NOT reduced by platooning — no fuel,")
+    print("  energy or emissions saving is claimed.")
 
     requests = SurplusDeficitRebalancer(max_requests=args.rebalance_preview).plan(
         swarm_fleet, swarm_sim.records(), swarm_sim.graph)

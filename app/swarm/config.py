@@ -59,8 +59,8 @@ What coordination changes is modelled road *space*. A pod following in formation
 keeps a shorter headway, so it is charged ``formation_occupancy_factor`` of the
 road space an independent pod would need:
 
-    road_occupancy_km = pod_km_outside_formation
-                      + Σ over swarms [ corridor_km × (1 + (n - 1) × factor) ]
+    road_occupancy_equiv_km = unplatooned_pod_km
+                            + Σ over swarms [ corridor_km × (1 + (n - 1) × factor) ]
 
 The factor is a **project assumption about headway**, not a measured
 aerodynamic, fuel or emissions saving. No such saving is claimed anywhere.
@@ -162,8 +162,9 @@ class SwarmConfig:
                 "min_formation_stability_min": self.min_formation_stability_min,
             },
             "road_occupancy": {
-                "formula": "pod_km_outside_formation + sum(corridor_km * (1 + (n-1) * factor))",
+                "formula": "unplatooned_pod_km + sum(corridor_km * (1 + (n-1) * factor))",
                 "formation_occupancy_factor": self.formation_occupancy_factor,
+                "unit": "equiv-km (single-pod-equivalent road-space kilometres, not distance)",
                 "note": "A headway assumption about road SPACE. Platooning changes no pod's "
                         "distance, travel time or energy here, and no aerodynamic, fuel or "
                         "emissions saving is claimed.",

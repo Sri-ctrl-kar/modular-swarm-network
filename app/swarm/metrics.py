@@ -1,45 +1,93 @@
 """Deterministic swarm metrics and the controlled baseline comparison.
 
-WHAT EACH DISTANCE METRIC MEANS (read this before quoting any of them)
----------------------------------------------------------------------
-``pod_distance_km``
-    Total kilometres physically driven by all pods. **Platooning does not reduce
-    this.** Four pods over a 5 km corridor drive 5 km each: 20 pod-km.
-
-``shared_corridor_distance_km``
-    Corridor kilometres traversed under coordination, counted **once per swarm**.
-    For the example above: 5 km. This is the "unique corridor distance".
-
-``coordinated_pod_km``
-    Pod-kilometres driven while in formation: corridor length × members. For the
-    example: 20 km. Reported next to the previous figure precisely so nobody
-    mistakes a platoon for a single vehicle.
-
-``independent_pod_km``
-    ``pod_distance_km`` minus ``coordinated_pod_km`` — distance driven alone.
-
-``road_occupancy_km``
-    An **estimate of road space used**, under the headway assumption in
-    ``app/swarm/config.py``: a pod following in formation is charged
-    ``formation_occupancy_factor`` of an independent pod's road space.
-
-        road_occupancy_km = independent_pod_km
-                          + Σ over swarms [ corridor_km × (1 + (n-1) × factor) ]
-
-``coordination_benefit_km``
-    ``pod_distance_km − road_occupancy_km``: the road space the coordination is
-    estimated to free up. **This is a road-space figure only.** It is not fuel,
-    not energy, not emissions and not time saved, and no such saving is claimed.
-
-A WARNING ABOUT COMPARING TOTALS ACROSS MODES
+TWO DIFFERENT QUANTITIES, TWO DIFFERENT UNITS
 ---------------------------------------------
-``ModeComparison`` puts independent and swarm runs side by side on an identical
-scenario, but their fleet totals still differ — and *not* because platooning
-discounts anything. Pods wait up to ``max_formation_delay_min`` before departing
-in swarm mode, which shifts departures and therefore changes which trips get
-served at all. Distance and energy totals move with the served set. Waiting also
-costs riders time, so expect average wait and completion time to rise. Report
-those honestly rather than quoting only the road-occupancy figure.
+The single most important thing to get right here is that **physical pod distance
+and road occupancy are not the same quantity and are not in the same unit.**
+
+``km`` (physical kilometres)
+    Actually driven on the tarmac. ``pod_distance_km`` is the sum of every pod's
+    odometer. Platooning never reduces it: four pods over a 5 km corridor drive
+    5 km each, 20 pod-km, formation or not.
+
+``equiv-km`` (single-pod-equivalent kilometres)
+    A *weighted* measure of how much road SPACE was used, where one pod driving
+    alone for one km is 1.0 equiv-km by definition. A pod following in formation
+    keeps a shorter headway and so is charged only
+    ``formation_occupancy_factor`` (0.4) of that. Fields carrying this unit are
+    named ``*_equiv_km`` and are **not distances** — do not add them to, or
+    compare them against, physical kilometres from anywhere else.
+
+EXACT DEFINITIONS AND FORMULAS
+------------------------------
+For each swarm *s*: ``d_s`` = ``shared_distance_km`` (corridor length actually
+travelled together), ``n_s`` = ``size`` (members), ``f`` =
+``formation_occupancy_factor``.
+
+``pod_distance_km``                     [km]
+    ``Σ over pods (pod.total_distance_km)``
+    Physical kilometres driven by every pod in the fleet.
+
+``total_shared_corridor_distance_km``   [km]
+    ``Σ over swarms (d_s)``
+    Corridor length traversed under coordination, counted **once per swarm** —
+    the "unique corridor distance". For four pods over a 5 km corridor: 5.
+
+``coordinated_pod_km``                  [km]
+    ``Σ over swarms (d_s × n_s)``
+    Pod-kilometres driven *while in a formation*. Same example: 20. Printed next
+    to the previous figure precisely so a platoon is never mistaken for one
+    vehicle. (``d_s × n_s`` is exact because a swarm's corridor is the common
+    prefix of its members' routes, so no member's trip can end strictly inside
+    it — every member drives the whole of ``d_s``. A test pins this.)
+
+``unplatooned_pod_km``                  [km]
+    ``pod_distance_km − coordinated_pod_km``
+    Pod-kilometres driven outside any formation. Note this counts the solo legs
+    of pods that *did* platoon, not only the pods that never joined a swarm.
+
+``road_occupancy_equiv_km``             [equiv-km]
+    ``unplatooned_pod_km + Σ over swarms (d_s × (1 + (n_s − 1) × f))``
+    Estimated road space used. With no swarms this reduces **exactly** to
+    ``pod_distance_km``, because every pod then occupies 1.0 equiv-km per km —
+    that identity is asserted by a test, and it is why the independent run
+    reports the same number twice rather than through any coincidence.
+
+``road_occupancy_saved_equiv_km``       [equiv-km]
+    ``pod_distance_km − road_occupancy_equiv_km``
+    which is identically ``Σ over swarms (d_s × (n_s − 1) × (1 − f))``.
+    The road space the coordination is estimated to free, **within this run**.
+
+``road_occupancy_saving_percent``       [%]
+    ``100 × road_occupancy_saved_equiv_km / pod_distance_km`` — the saving as a
+    share of *this run's own* pod-km. Being scale-free, this is the only one of
+    these figures that can be compared across two runs directly.
+
+**This is a road-space estimate resting on one invented constant.**
+It is not fuel, not energy, not emissions and not time saved, and no such saving
+is claimed anywhere.
+
+INSTANTANEOUS VERSUS CUMULATIVE
+-------------------------------
+``pods_currently_in_swarms`` and ``pods_currently_independent`` are a snapshot of
+the moment the metrics were taken. After a completed run every swarm has finished,
+so they read 0 and *total_pods* — that is correct, not a bug, and it is why the
+cumulative ``distinct_pods_ever_in_a_swarm`` exists and is what the CLI reports.
+
+COMPARING TWO MODES: READ THE RAW TOTALS WITH CARE
+--------------------------------------------------
+``ModeComparison`` puts an independent and a swarm run side by side on an
+identical scenario, but their raw totals are **not** like-for-like, and the
+difference is not a platooning effect. Pods wait up to
+``max_formation_delay_min`` before departing in swarm mode, which shifts
+departures and therefore changes which trips get served at all; distance and
+energy totals move with the served set, and riders wait longer.
+
+So a swarm run can legitimately show *higher* pod distance and *higher*
+completion time than the baseline. Comparing the two ``road_occupancy_equiv_km``
+totals directly conflates coordination with that different served set; compare
+``road_occupancy_saving_percent``, which is scale-free, and report the completion
+and distance changes honestly alongside it.
 
 Averages are rounded modestly, and an average over zero samples is ``None``
 rather than a misleading ``0.0``.
@@ -74,8 +122,9 @@ class SwarmMetrics:
     # Participation
     total_pods: int
     active_pods: int
-    pods_in_swarms: int
-    independent_pods: int
+    # Snapshot of *this instant*; after a finished run these read 0 and total_pods.
+    pods_currently_in_swarms: int
+    pods_currently_independent: int
     swarm_participation_percent: float | None
     distinct_pods_ever_in_a_swarm: int
     # Swarms
@@ -92,12 +141,14 @@ class SwarmMetrics:
     average_shared_corridor_distance_km: float | None
     total_shared_corridor_distance_km: float
     average_shared_corridor_edges: float | None
-    # Distance accounting (see module docstring for exact definitions)
+    # Distance accounting. Units matter: *_km are physical kilometres driven,
+    # *_equiv_km are single-pod-equivalent road-space kilometres. See the module
+    # docstring for the exact formula behind each one.
     pod_distance_km: float
     coordinated_pod_km: float
-    independent_pod_km: float
-    road_occupancy_km: float
-    coordination_benefit_km: float
+    unplatooned_pod_km: float
+    road_occupancy_equiv_km: float
+    road_occupancy_saved_equiv_km: float
     road_occupancy_saving_percent: float | None
     formation_occupancy_factor: float
 
@@ -105,8 +156,17 @@ class SwarmMetrics:
         return {field: getattr(self, field) for field in self.__dataclass_fields__}
 
 
-def compute_swarm_metrics(simulation, config: SwarmConfig = DEFAULT_SWARM_CONFIG) -> SwarmMetrics:
-    """Summarise the swarm layer of a ``SwarmSimulation``."""
+def compute_swarm_metrics(simulation, config: SwarmConfig | None = None) -> SwarmMetrics:
+    """Summarise the swarm layer of a ``SwarmSimulation``.
+
+    ``config`` defaults to the simulation's **own** ``swarm_config``. That matters:
+    the occupancy figures depend on ``formation_occupancy_factor``, so computing
+    them against a different config than the run used would silently report road
+    space under an assumption the simulation never made. Pass ``config`` only to
+    deliberately re-score a run under a different headway assumption.
+    """
+    if config is None:
+        config = getattr(simulation, "swarm_config", DEFAULT_SWARM_CONFIG)
     fleet = simulation.fleet
     pods = fleet.pods()
     swarms: tuple[Swarm, ...] = simulation.swarms()
@@ -125,21 +185,25 @@ def compute_swarm_metrics(simulation, config: SwarmConfig = DEFAULT_SWARM_CONFIG
     # Distance actually covered in formation, from each swarm's own progress.
     coordinated_pod_km = sum(swarm.coordinated_pod_km() for swarm in swarms)
     shared_corridor_distance = sum(swarm.shared_distance_km for swarm in swarms)
-    independent_pod_km = max(0.0, pod_distance - coordinated_pod_km)
+    # Formation km are a subset of driven km, so this cannot go negative while the
+    # pods that platooned are still in the fleet. The guard only catches a pod
+    # removed from the fleet after platooning, which would otherwise under-count
+    # pod_distance while its swarm still counts.
+    unplatooned_pod_km = max(0.0, pod_distance - coordinated_pod_km)
 
     factor = config.formation_occupancy_factor
     formation_occupancy = sum(
         swarm.shared_distance_km * (1.0 + (swarm.size - 1) * factor) for swarm in swarms
     )
-    road_occupancy = independent_pod_km + formation_occupancy
-    benefit = pod_distance - road_occupancy
+    road_occupancy = unplatooned_pod_km + formation_occupancy
+    saved = pod_distance - road_occupancy
 
     return SwarmMetrics(
         swarms_enabled=simulation.swarms_enabled,
         total_pods=len(pods),
         active_pods=len(active_pods),
-        pods_in_swarms=len(in_swarms),
-        independent_pods=len(pods) - len(in_swarms),
+        pods_currently_in_swarms=len(in_swarms),
+        pods_currently_independent=len(pods) - len(in_swarms),
         swarm_participation_percent=(round(100.0 * len(ever_in_a_swarm) / len(pods), 2)
                                      if pods else None),
         distinct_pods_ever_in_a_swarm=len(ever_in_a_swarm),
@@ -160,10 +224,10 @@ def compute_swarm_metrics(simulation, config: SwarmConfig = DEFAULT_SWARM_CONFIG
         average_shared_corridor_edges=_mean(corridor_edges, RATIO_DECIMALS),
         pod_distance_km=round(pod_distance, DISTANCE_DECIMALS),
         coordinated_pod_km=round(coordinated_pod_km, DISTANCE_DECIMALS),
-        independent_pod_km=round(independent_pod_km, DISTANCE_DECIMALS),
-        road_occupancy_km=round(road_occupancy, DISTANCE_DECIMALS),
-        coordination_benefit_km=round(benefit, DISTANCE_DECIMALS),
-        road_occupancy_saving_percent=(round(100.0 * benefit / pod_distance, 2)
+        unplatooned_pod_km=round(unplatooned_pod_km, DISTANCE_DECIMALS),
+        road_occupancy_equiv_km=round(road_occupancy, DISTANCE_DECIMALS),
+        road_occupancy_saved_equiv_km=round(saved, DISTANCE_DECIMALS),
+        road_occupancy_saving_percent=(round(100.0 * saved / pod_distance, 2)
                                        if pod_distance > 0 else None),
         formation_occupancy_factor=factor,
     )
