@@ -1,4 +1,4 @@
-"""CLI for Milestones 1, 2, 3 and 4.
+"""CLI for Milestones 1 through 5.
 
 Examples:
     python -m app.cli.main route --from "North Station" --to "Airport"
@@ -11,6 +11,7 @@ Examples:
     python -m app.cli.main demand-demo --profile peak_hour --passengers 2000 --no-routing
     python -m app.cli.main fleet-demo --pods 100 --passengers 1000
     python -m app.cli.main swarm-demo --pods 100 --passengers 1000
+    python -m app.cli.main rebalancing-demo --pods 100 --passengers 1000
 
 Results go to stdout; logs and errors go to stderr. Exit codes: 0 ok,
 1 no route, 2 invalid input / scenario error.
@@ -48,6 +49,12 @@ from app.network.builder import LoadedScenario, dump_scenario, load_scenario
 from app.network.synthetic_city import build_synthetic_city, generate_synthetic_city_dict
 from app.routing import ALGORITHM_LABELS, find_route
 from app.simulation.state import SimulationState
+from app.rebalancing import (
+    DEFAULT_REBALANCING_CONFIG,
+    RebalancingSimulation,
+    build_demand_map,
+    compute_rebalancing_metrics,
+)
 from app.swarm import (
     DEFAULT_SWARM_CONFIG,
     SurplusDeficitRebalancer,
@@ -431,6 +438,171 @@ def cmd_swarm_demo(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rebalancing_demo(args: argparse.Namespace) -> int:
+    """Forecast demand, reposition idle pods, and show what it cost (M5).
+
+    Forecasting and rebalancing are deterministic and explainable — no machine
+    learning and no LLM — and the heuristic is not claimed to be optimal.
+    """
+    profile = resolve_demand_profile(args.profile)
+    fleet_config = DEFAULT_FLEET_CONFIG
+    if args.capacity is not None:
+        fleet_config = replace(fleet_config, default_pod_capacity=args.capacity)
+    rebal_config = DEFAULT_REBALANCING_CONFIG
+    if args.interval is not None:
+        rebal_config = replace(rebal_config, rebalance_interval_min=args.interval)
+    if args.horizon is not None:
+        rebal_config = replace(rebal_config, forecast_horizon_min=args.horizon)
+    if args.max_per_cycle is not None:
+        rebal_config = replace(rebal_config, max_repositions_per_cycle=args.max_per_cycle)
+
+    def fresh():
+        scenario = _load(args)
+        state = SimulationState.from_scenario(scenario)
+        demand = generate_demand(state.graph, seed=args.demand_seed,
+                                 passenger_count=args.passengers, profile=profile)
+        fleet = generate_fleet(state.graph, fleet_size=args.pods, seed=args.fleet_seed,
+                               config=fleet_config, profile=profile)
+        return scenario, state, demand, fleet
+
+    scenario, state, _, _ = fresh()
+    runs = {}
+    for enabled in (False, True):
+        _, run_state, run_demand, run_fleet = fresh()
+        simulation = RebalancingSimulation(
+            run_state.graph, run_fleet, run_demand.trips, fleet_config,
+            swarm_config=DEFAULT_SWARM_CONFIG, rebalancing_config=rebal_config,
+            profile=profile, enable_swarms=not args.no_swarms,
+            enable_rebalancing=enabled, algorithm=args.algorithm)
+        simulation.run(max_ticks=args.max_ticks)
+        runs[enabled] = (simulation, run_fleet,
+                         compute_fleet_metrics(run_fleet, simulation.records(),
+                                               simulation.time_min),
+                         compute_rebalancing_metrics(simulation))
+
+    sim, fleet, fleet_m, rebal_m = runs[True]
+    base_sim, base_fleet, base_fleet_m, base_m = runs[False]
+
+    print(_header(scenario, state))
+    print("Adaptive fleet rebalancing [SYNTHETIC — deterministic, explainable]")
+    print("------------------------------------------------------------------")
+    print("Demand is forecast from already-observed trips plus the published scenario")
+    print("profile. No machine learning and no LLM is involved, and the rebalancing")
+    print("heuristic is not claimed to be globally optimal.")
+
+    print(f"\nFleet: {rebal_m.trips_served + rebal_m.unserved_trips} trips, "
+          f"{len(fleet)} pods x {fleet_config.default_pod_capacity} seats"
+          f"   Demand profile: {profile.profile_id}")
+    print(f"Forecast: {rebal_config.forecast_horizon_min:g} min horizon from a "
+          f"{rebal_config.forecast_recent_window_min:g} min window "
+          f"(weights {rebal_config.forecast_recent_weight:g} recent / "
+          f"{rebal_config.forecast_profile_weight:g} profile)")
+    print(f"Cycle every {rebal_config.rebalance_interval_min:g} min, at most "
+          f"{rebal_config.max_repositions_per_cycle} moves per cycle")
+
+    # ---- BEFORE: the imbalance mid-run, where it actually bites ------------------
+    # Taken at --snapshot-min rather than at the end of the day, because by the last
+    # tick there is no demand left and every deficit reads zero.
+    _, snap_state, snap_demand, snap_fleet = fresh()
+    snap_sim = RebalancingSimulation(
+        snap_state.graph, snap_fleet, snap_demand.trips, fleet_config,
+        swarm_config=DEFAULT_SWARM_CONFIG, rebalancing_config=rebal_config, profile=profile,
+        enable_swarms=not args.no_swarms, enable_rebalancing=False, algorithm=args.algorithm)
+    snap_sim.run(until_min=args.snapshot_min)
+    base_map = build_demand_map(snap_sim.graph, snap_fleet, snap_sim.records(),
+                                snap_sim.time_min, rebal_config, profile,
+                                include_actuals=True)
+    print(f"\nBEFORE REBALANCING (no-rebalancing run, at minute {args.snapshot_min:g})")
+    print(f"  Total forecast deficit: {base_map.total_deficit} pods short across "
+          f"{len(base_map.deficit_rows())} node(s)")
+    print(f"  Total surplus: {base_map.total_surplus} pods spare")
+    print(f"  {'node':<20}{'forecast':>9}{'avail':>7}{'balance':>9}{'actual':>8}")
+    for row in base_map.deficit_rows()[:args.examples]:
+        print(f"  {state.graph.get_node(row.node_id).name:<20}{row.forecast_demand:>9.2f}"
+              f"{row.available_pods:>7}{row.balance:>9.2f}"
+              f"{row.actual_near_future_demand:>8}")
+    print("  (actual = what really arrived in the forecast window, shown for comparison;")
+    print("   the forecast never reads it)")
+    print(f"  Expected unserved demand: {base_m.unserved_trips} trips went unserved over "
+          f"the whole run")
+
+    # ---- REBALANCING: what actually moved --------------------------------------
+    print("\nREBALANCING")
+    print(f"  Cycles run: {rebal_m.cycles_run}")
+    print(f"  Requests: {rebal_m.reposition_requests} "
+          f"({rebal_m.accepted_requests} accepted, {rebal_m.rejected_requests} rejected)")
+    print(f"  Completed: {rebal_m.completed_repositions}   Failed: {rebal_m.failed_repositions}")
+    print(f"  Reasons: " + ", ".join(f"{name}={count}"
+                                     for name, count in rebal_m.reposition_reason_counts))
+    print(f"  Deadhead distance: {rebal_m.reposition_distance_km} km")
+    print(f"  Deadhead energy: {rebal_m.reposition_energy_kwh} kWh")
+    print(f"  Average move: {rebal_m.average_reposition_distance_km} km / "
+          f"{rebal_m.average_reposition_time_min} min")
+    top_moves = sorted(sim.repositions(),
+                       key=lambda a: (-a.priority_score, a.reposition_id))[:args.examples]
+    print(f"  Highest-priority moves:")
+    for assignment in top_moves:
+        print(f"    {assignment.reposition_id}  {assignment.pod_id}  "
+              f"{state.graph.get_node(assignment.origin_node_id).name} -> "
+              f"{state.graph.get_node(assignment.target_node_id).name}"
+              f"  {assignment.reason.value}")
+        print(f"      deficit {assignment.target_deficit_at_dispatch:.2f} -> score "
+              f"{assignment.priority_score:.2f},  {assignment.actual_distance_km} km, "
+              f"{assignment.actual_energy_kwh} kWh, arrived at "
+              f"{assignment.arrival_time_min:.1f} min")
+
+    # ---- AFTER -------------------------------------------------------------------
+    print("\nAFTER REBALANCING")
+    print(f"  Remaining forecast deficit: {rebal_m.final_total_deficit} "
+          f"(average across cycles: {rebal_m.average_deficit})")
+    print(f"  Trips served: {rebal_m.trips_served}   Unserved: {rebal_m.unserved_trips}")
+    print(f"  Average wait: {rebal_m.average_wait_min} min   "
+          f"Maximum wait: {rebal_m.maximum_wait_min} min")
+    print(f"  Repositioning cost: {rebal_m.reposition_distance_km} km and "
+          f"{rebal_m.reposition_energy_kwh} kWh driven empty "
+          f"({rebal_m.deadhead_share_percent}% of all driving)")
+
+    # ---- comparison --------------------------------------------------------------
+    print("\nNO REBALANCING vs ADAPTIVE REBALANCING "
+          "(same network, demand, fleet, seed and horizon)")
+    print(f"  {'metric':<34}{'no rebalancing':>16}{'adaptive':>12}")
+    rows = [
+        ("trips served", base_m.trips_served, rebal_m.trips_served),
+        ("unserved trips", base_m.unserved_trips, rebal_m.unserved_trips),
+        ("average wait (min)", base_m.average_wait_min, rebal_m.average_wait_min),
+        ("maximum wait (min)", base_m.maximum_wait_min, rebal_m.maximum_wait_min),
+        ("average completion (min)", base_m.average_completion_time_min,
+         rebal_m.average_completion_time_min),
+        ("pod distance, all (km)", base_m.pod_distance_km, rebal_m.pod_distance_km),
+        ("  of which with passengers", base_m.passenger_distance_km,
+         rebal_m.passenger_distance_km),
+        ("  of which empty (deadhead)", base_m.reposition_distance_km,
+         rebal_m.reposition_distance_km),
+        ("energy, all (kWh)", base_fleet_m.total_energy_kwh, fleet_m.total_energy_kwh),
+        ("average deficit across cycles", base_m.average_deficit, rebal_m.average_deficit),
+        ("deficit at last cycle", base_m.deficit_at_last_cycle, rebal_m.deficit_at_last_cycle),
+        ("swarms formed", base_sim.formation_count, sim.formation_count),
+    ]
+    for label, left, right in rows:
+        print(f"  {label:<34}{left!s:>16}{right!s:>12}")
+
+    gained = rebal_m.trips_served - base_m.trips_served
+    print(f"\n  Additional trips served: {gained:+d}")
+    if rebal_m.reposition_distance_km > 0 and gained > 0:
+        print(f"  Cost of those trips: {rebal_m.reposition_distance_km / gained:.2f} km driven "
+              f"empty per additional trip")
+        print(f"  ({gained / rebal_m.reposition_distance_km:.4f} additional trips per "
+              f"deadhead km — a rate of trips over kilometres, NOT a return on investment)")
+    elif gained <= 0:
+        print("  Rebalancing did not increase trips served here; the cost above was spent "
+              "for no service gain.")
+    print("  Rebalancing is not free: every deadhead kilometre above was driven empty and")
+    print("  is reported in full, never netted off the passenger figures.")
+
+    print(f"\nFleet fingerprint: {sim.snapshot().fingerprint()}")
+    return 0
+
+
 def cmd_export(args: argparse.Namespace) -> int:
     text = dump_scenario(generate_synthetic_city_dict(args.seed))
     if args.output == "-":
@@ -442,7 +614,7 @@ def cmd_export(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="app.cli.main", description="Modular Swarm Network — M1 + M2 + M3 + M4 CLI")
+    parser = argparse.ArgumentParser(prog="app.cli.main", description="Modular Swarm Network — M1-M5 CLI")
     parser.add_argument("--log-level", default="WARNING",
                         choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="log level (logs go to stderr)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -521,6 +693,28 @@ def build_parser() -> argparse.ArgumentParser:
     swarm.add_argument("--algorithm", choices=["astar", "dijkstra"], default="astar")
     add_source(swarm)
     swarm.set_defaults(func=cmd_swarm_demo)
+
+    rebal = sub.add_parser("rebalancing-demo",
+                           help="forecast demand, reposition idle pods, and show the cost")
+    rebal.add_argument("--pods", type=int, default=100)
+    rebal.add_argument("--capacity", type=int, default=None)
+    rebal.add_argument("--passengers", type=int, default=1000)
+    rebal.add_argument("--profile", default="baseline",
+                       help="demand profile name (baseline, peak_hour) or a demand JSON path")
+    rebal.add_argument("--fleet-seed", type=int, default=DEFAULT_FLEET_SEED)
+    rebal.add_argument("--demand-seed", type=int, default=DEFAULT_DEMAND_SEED)
+    rebal.add_argument("--interval", type=float, default=None,
+                       help="minutes between rebalancing cycles")
+    rebal.add_argument("--horizon", type=float, default=None, help="forecast horizon in minutes")
+    rebal.add_argument("--max-per-cycle", type=int, default=None)
+    rebal.add_argument("--no-swarms", action="store_true", help="disable M4 swarm formation")
+    rebal.add_argument("--examples", type=int, default=3)
+    rebal.add_argument("--snapshot-min", type=float, default=520.0,
+                       help="minute at which to snapshot the BEFORE imbalance")
+    rebal.add_argument("--max-ticks", type=int, default=100_000)
+    rebal.add_argument("--algorithm", choices=["astar", "dijkstra"], default="astar")
+    add_source(rebal)
+    rebal.set_defaults(func=cmd_rebalancing_demo)
 
     export = sub.add_parser("export-scenario", help="write the synthetic city as scenario JSON")
     export.add_argument("--seed", type=int, default=DEFAULT_SEED)

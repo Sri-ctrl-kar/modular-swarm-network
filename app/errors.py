@@ -114,3 +114,23 @@ class SwarmNotFoundError(SwarmError):
 
 class IncompatibleSwarmError(SwarmError):
     """Pods were asked to form a swarm that the compatibility rules reject."""
+
+
+class RebalancingError(SwarmNetworkError):
+    """Base class for adaptive fleet-rebalancing (M5) errors."""
+
+
+class RebalancingConfigError(RebalancingError, ValueError):
+    """A rebalancing configuration or forecast weighting is malformed."""
+
+
+class ForecastError(RebalancingError):
+    """A demand forecast could not be produced from the inputs given."""
+
+
+class RepositioningError(RebalancingError):
+    """A repositioning move cannot be dispatched or executed as requested."""
+
+
+class ActionValidationError(RebalancingError, ValueError):
+    """A proposed action failed the deterministic validator at the M6 boundary."""

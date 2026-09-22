@@ -1,13 +1,13 @@
-# Modular Swarm Network — Milestones 1 + 2 + 3 + 4
+# Modular Swarm Network — Milestones 1 through 5
 
-**Deterministic city + network foundation, passenger demand, an autonomous electric
-pod fleet, and rule-based swarm formation and platooning.**
+**A fully deterministic city, demand, fleet, platooning and adaptive-rebalancing
+simulation. No machine learning and no LLM anywhere in it.**
 
 > ⚠️ **All data in this milestone is SYNTHETIC.** The city, coordinates, distances,
 > capacities and traffic counts are invented. Nothing here claims real-world
 > transportation performance.
 
-## 1. What M1-M4 do
+## 1. What M1-M5 do
 
 M1 answers one question reliably and reproducibly:
 
@@ -25,16 +25,20 @@ M4 adds a fourth:
 
 > *Which of those pods have compatible enough journeys to travel as a coordinated platoon, where do they split, and what does coordinating actually change?*
 
+M5 adds a fifth, and answers the limitation M3 exposed:
+
+> *Demand has moved. Which idle pods should drive empty toward where it is going, what does that repositioning cost, and is it worth it?*
+
 It provides validated node/edge models, a directed weighted graph with dynamic
 (traffic-dependent) costs, a transparent congestion model, Dijkstra and A*
 routing with a proven-admissible heuristic, a seeded synthetic city, a
 human-readable scenario file, a minimal simulation state, and a CLI.
 
-## 2. What M1-M4 deliberately do NOT do
+## 2. What M1-M5 deliberately do NOT do
 
-No magnetic linking, no adaptive fleet rebalancing (M4 ships the interface only —
-see §10), no Gemini / LLM / agents, no demand prediction, no dashboard or
-animation, no route caching, no real map data.
+No magnetic linking, no Gemini / LLM / agents / orchestration, no dashboard or
+animation, no route caching, no real map data, no cloud services. M5 defines the
+boundary a future orchestrator would sit above (§11) but implements no orchestrator.
 The runtime uses **only the Python standard library** and works fully offline.
 
 ## 3. Architecture
@@ -43,6 +47,14 @@ The runtime uses **only the Python standard library** and works fully offline.
                  ┌────────────────────────────┐
                  │  app/cli/main.py  (argparse)│   stdout = results, stderr = logs/errors
                  └──────────────┬─────────────┘
+                                │
+          ┌─────────────────────▼─────────────────────┐
+          │ app/rebalancing/  (M5)                    │  forecast, demand map,
+          │  config.py  forecast.py  demand_map.py    │  eligibility, matching,
+          │  eligibility.py  planner.py  execution.py │  empty repositioning
+          │  simulation.py  metrics.py                │
+          │  observation.py  <- the M6 boundary       │  read-only + validator
+          └─────────────────────┬─────────────────────┘
                                 │
           ┌─────────────────────▼─────────────────────┐
           │ app/swarm/  (M4)                          │  compatibility, formation,
@@ -89,10 +101,11 @@ The runtime uses **only the Python standard library** and works fully offline.
 ```
 
 Dependencies point downward only:
-`models ← network ← routing ← simulation ← demand ← fleet ← swarm ← cli`.
+`models ← network ← routing ← simulation ← demand ← fleet ← swarm ← rebalancing ← cli`.
 Each layer consumes the ones below and is imported by none of them; tests walk the
-lower packages to enforce that none of `app.demand`, `app.fleet` or `app.swarm`
-is imported downward.
+lower packages to enforce that none of `app.demand`, `app.fleet`, `app.swarm` or
+`app.rebalancing` is imported downward. A future M6 orchestrator sits above the
+whole stack and reaches it only through §11's read-only observation and validator.
 
 ## 4. Data models
 
@@ -108,6 +121,9 @@ is imported downward.
 | `SharedCorridor` (M4, frozen) | `edge_ids`, `origin_node_id`, `divergence_node_id`, `distance_km`, `travel_time_min` | non-empty, no repeated edge, non-negative totals |
 | `Swarm` (M4) | `swarm_id`, sorted `pod_ids`, `leader_pod_id`, `corridor`, `status`, progress, `formation_time_min` | **≥ 2 pods**, leader is a member, progress never exceeds the corridor or goes backwards |
 | `SwarmSnapshot` (M4, frozen) | `time_min`, per-swarm state, status counts, formation/split counts | stable SHA-256 `fingerprint()`, distance rounded |
+| `DemandForecast` (M5, frozen) | per-node `NodeForecast` with both components, `upcoming_bucket`, `has_sufficient_history` | unique nodes, sorted, thin history refused |
+| `SpatialDemandMap` (M5, frozen) | per-node `DemandMapRow`: current/forecast demand, available pods, ratio, balance, deficit, surplus | sorted by node, ratio `None` when no pods |
+| `RepositionAssignment` (M5) | `reposition_id`, pod, origin/target, reason, priority, estimated **and actual** km/min/kWh | status machine, records never deleted |
 
 Only `current_vehicle_count` is mutable, via `Edge.set_vehicle_count()`.
 The graph additionally enforces two **geometry rules** on every edge:
@@ -694,7 +710,239 @@ trips went unserved. `plan()` is **read-only**: it moves no pod, assigns no trip
 and changes no traffic, and nothing in M4 executes what it returns. A test asserts
 all of that.
 
-## 11. How to run
+## 11. Adaptive fleet rebalancing (M5)
+
+> **M5 uses deterministic, explainable demand forecasting and fleet rebalancing.
+> No machine learning or LLM is involved.**
+
+> **Rebalancing is a heuristic and is not claimed to be globally optimal.**
+
+M3 exposed the real bottleneck: pods drift to wherever demand last took them, so
+trips go unserved for want of a pod *in the right place* rather than for want of a
+pod. M5 closes that loop:
+
+```
+demand → demand imbalance → rebalancing decision → pod repositioning
+       → better spatial availability → more trips served
+```
+
+### Demand windows
+
+Four windows over one timeline, at simulated minute `t`:
+
+| Window | Span | Role |
+|---|---|---|
+| **recent** | `[t − 60, t)` | the history the forecast learns a rate from |
+| **current** | `[t − 15, t]` | "demand right now", reported for context |
+| **near future** | `[t, t + 30)` | the window the forecast is *about* |
+| **forecast** | — | the estimate for that window |
+
+### The deterministic forecast — and why it is not clairvoyant
+
+The simulation holds the whole trip list, so peeking at future demand would be
+trivial and would make every number meaningless. It does not. `build_forecast` is
+handed the trip records and immediately filters them to the **recent** window; it
+reads nothing else about the future. Its two inputs are both available to an
+operator at the moment it runs:
+
+```
+forecast(node) = horizon × [ w_recent  × recent_rate(node)
+                           + w_profile × total_recent_rate × profile_share(node) ]
+
+recent_rate(node)   = trips requested from node in the recent window / window length
+profile_share(node) = production_weight(role(node), upcoming bucket)
+                      / Σ over nodes of the same weight
+```
+
+`w_recent = w_profile = 0.5`, and they must sum to 1. The second term is the
+"known scenario profile": M2's published time-of-day production weights, a declared
+assumption rather than an observation. The **upcoming** bucket is the one covering
+`t + horizon`, which is what lets pods move *before* a peak instead of after it.
+
+**Thin history is refused, not extrapolated.** Until `min_history_min` (15) of
+simulated time has passed, one trip in a two-minute window would imply an enormous
+hourly rate, so the forecast returns zeros, reports `has_sufficient_history=False`,
+and nothing is repositioned. A test asserts that adding 50 future trips leaves the
+forecast byte-identical.
+
+### The spatial demand map
+
+Demand is counted in **trips**, supply in **pods**: one pod serves one trip at a
+time whatever the party size, so the two are directly comparable.
+
+| Column | Definition |
+|---|---|
+| `current_demand` | trips requested from the node in the current window |
+| `forecast_demand` | the forecast above, for the near-future window |
+| `available_pods` | pods there that are **eligible to be repositioned** |
+| `demand_supply_ratio` | `forecast / available`, or `None` when no pods — undefined, not infinity |
+| `balance` | `available_pods − forecast_demand`; negative means short |
+| `deficit` / `surplus` | `max(0, −balance)` / `max(0, balance)` |
+| `actual_near_future_demand` | what really arrived — **evaluation only**, never a forecast input |
+
+Mid-morning on the seed-42 city the map shows exactly the M3 imbalance:
+
+```
+node                 forecast  avail  balance  actual
+Residential South        9.58      0    -9.58      11
+Riverside                8.58      0    -8.58      11
+Residential North        8.33      0    -8.33      13
+```
+
+29.19 pods short across 9 nodes, while University, Industrial Zone and Tech Park
+sit on 17, 14 and 11 idle pods.
+
+### Which pods may move
+
+**A passenger's pod is never taken.** A pod is eligible only when it is `IDLE`
+(so not in passenger service and not already repositioning), not `CHARGING`, not a
+member of an active swarm — M4 owns that pod — and has battery for the move plus a
+reserve. Every rejection carries a machine-readable reason (`not_idle`,
+`is_charging`, `in_active_swarm`, `insufficient_battery`).
+
+### The rebalancing decision
+
+1. Build the demand map.
+2. Walk the **deficit** nodes, biggest shortfall first, ties on `node_id`.
+3. Fill each one pod at a time. A candidate must stand at a node that still has
+   `≥ min_surplus_to_release` spare *after everything already claimed this cycle* —
+   **a node is never stripped below its own forecast to feed another** — have a
+   route (M1's router, current traffic), be within `max_reposition_distance_km`,
+   and pass the battery rule. The **nearest** survivor wins, ties on `pod_id`.
+4. If cycle capacity remains, drain badly clumped nodes (more than
+   `max_surplus_before_drain` above their own forecast) toward the busiest node.
+5. Stop at `max_repositions_per_cycle`, or when `max_concurrent_repositions` pods
+   are already moving.
+
+Planning mutates nothing, and a cycle runs every `rebalance_interval_min`.
+
+**Why a pod was moved** — the whole priority formula:
+
+```
+score = deficit × priority_deficit_weight − distance_km × priority_distance_weight
+```
+
+With the defaults (1.0 and 0.05) a node short of 10 pods 8 km away scores
+10 − 0.4 = 9.6. A reader can reproduce any score by hand from the request's target
+deficit and distance.
+
+**Machine-readable reasons**, one per request, in precedence order:
+
+| Reason | Meaning |
+|---|---|
+| `DEMAND_DEFICIT` | the target is short **right now** |
+| `PEAK_PREPOSITIONING` | no present shortfall, only a forecast one — the pod moves before the peak |
+| `SUPPLY_SURPLUS` | the target is not short; the origin is clumped and is being drained |
+
+### Repositioning movement
+
+A repositioning pod drives **empty**, through M3's movement machinery unchanged:
+`pod.assign(..., kind=TripKind.REPOSITIONING)` with **zero** occupied seats, then
+M3's own departure, `advance_pod` and release. **There is no second movement model,
+no second cost model and no second congestion model.**
+
+`PASSENGER_TRIP` and `REPOSITIONING_TRIP` are kept apart at every level, so an
+empty move can never flatter a passenger figure:
+
+* the pod counts it under `completed_repositioning_count`, never `completed_trip_count`;
+* no `TripRecord` is created, so M3's trip metrics never see it;
+* occupied seats stay 0;
+* its kilometres are reported as **deadhead** and never netted off anything.
+
+An empty pod also never joins a swarm — it has no passengers to coordinate — and
+while moving it is not `IDLE`, so passenger assignment cannot take it. On arrival
+it returns to `IDLE` and is immediately available for service again.
+
+### Congestion and battery
+
+Repositioning routes come from M1's router under **current** traffic, so congestion
+changes the route and therefore the time: a test congests `E011` and watches a
+move reroute from `E009 → E011` to `E013 → E003` with a different travel time.
+Energy uses M3's battery model, so congestion raises what a move costs too.
+
+A move is refused unless `battery ≥ energy_for_the_move + 15 %` reserve, so a pod
+arrives able to work rather than stranded. The reserve is stricter than M3's 5 %
+passenger reserve precisely because an empty move earns nothing.
+
+### The cost, never hidden
+
+| Metric | Meaning |
+|---|---|
+| `reposition_distance_km` | km driven **empty** (deadhead) |
+| `reposition_energy_kwh` | kWh spent doing it |
+| `passenger_distance_km` | pod km **minus** deadhead — distance with someone aboard |
+| `pod_distance_km` | every km driven, deadhead included; rebalancing makes this go **up** |
+| `deadhead_share_percent` | deadhead as a share of all driving |
+
+The efficiency figure has one exact definition and needs **both** runs:
+
+```
+rebalancing_trips_per_deadhead_km
+    = (trips completed WITH − trips completed WITHOUT) / empty km driven WITH
+```
+
+It is a rate of additional trips per empty kilometre. It can be zero or negative,
+it is `None` when nothing was repositioned, and its reciprocal
+`deadhead_km_per_additional_trip` is reported alongside because it is easier to
+reason about. **It is not a return on investment**: it puts trips over kilometres
+and says nothing about money, emissions or welfare.
+
+### What it actually achieved, costs included
+
+100 pods, 1,000 trips, identical network, demand, fleet, seed and horizon:
+
+| metric | no rebalancing | adaptive |
+|---|---|---|
+| trips served | 499 | **904** |
+| unserved trips | 501 | **96** |
+| average wait (min) | 4.63 | 5.24 |
+| average completion (min) | 28.81 | 31.35 |
+| pod distance, all (km) | 8 045 | 25 052 |
+| — with passengers | 8 045 | 16 073 |
+| — **empty (deadhead)** | 0 | **8 979** |
+| energy, all (kWh) | 1 453 | 4 525 |
+| average deficit across cycles | 12.38 | **8.10** |
+| swarms formed | 28 | 95 |
+
++405 trips served, at **22.17 km driven empty per additional trip** (0.0451 trips
+per deadhead km). Deadhead is 35.8 % of all driving. Note the two figures that got
+**worse**: average wait rose 4.63 → 5.24 min and average completion 28.81 → 31.35
+min, because repositioning competes for pods and adds driving. Both are reported
+rather than buried.
+
+Both modes measure the imbalance on the same cadence — the baseline observes
+without acting — so `average deficit` is a like-for-like comparison.
+
+### The M6 boundary — defined here, not implemented here
+
+`app/rebalancing/observation.py` defines where a future orchestrator would attach:
+
+```
+DATA → DETERMINISTIC SIMULATION → METRICS → (M6 ORCHESTRATOR)
+     → STRUCTURED PROPOSAL → VALIDATOR → SIMULATION
+```
+
+Three things make that boundary real rather than decorative:
+
+1. **`observe()` is read-only.** It returns a frozen, JSON-serialisable snapshot of
+   plain values covering network, demand, fleet, swarm, forecast, rebalancing and
+   metrics state. It hands out no graph, fleet, pod or simulation, so a caller
+   holding an observation *cannot* mutate anything through it.
+2. **A `ProposedAction` is inert data** — an action type from a closed enum
+   (`REQUEST_REBALANCING`, `SET_DEMAND_SCENARIO`, `SET_PARAMETER`,
+   `COMPARE_SCENARIOS`) plus parameters. Building one executes nothing.
+3. **`ActionValidator` is deterministic and bounded.** Every settable parameter has
+   an explicit numeric range; unknown actions, unknown parameters and out-of-range
+   values are rejected with machine-readable reasons, and there is no trusted path
+   that skips it.
+
+`apply_validated_action` refuses anything unvalidated or rejected and handles
+exactly one action, `REQUEST_REBALANCING`. The others validate but are not applied,
+because deciding *when* to switch scenario or run a comparison is orchestration —
+**M6's job, and deliberately absent here. There is no Gemini, no LLM and no agent
+in this milestone.**
+
+## 12. How to run
 
 Python 3.11+. No installation is needed for the runtime.
 
@@ -749,10 +997,24 @@ corridors, split counts, participation, the **independent-vs-swarm comparison**,
 the road-space estimate with its assumption spelled out, a preview of planned
 (never executed) reposition requests, and both fingerprints.
 
+```bash
+# M5 — adaptive fleet rebalancing
+python -m app.cli.main rebalancing-demo
+python -m app.cli.main rebalancing-demo --pods 100 --passengers 1000
+python -m app.cli.main rebalancing-demo --interval 20 --horizon 45 --max-per-cycle 5
+python -m app.cli.main rebalancing-demo --pods 40 --no-swarms --snapshot-min 400
+```
+
+`rebalancing-demo` prints the forecast settings, the imbalance **before** (snapshotted
+mid-run, where it actually bites, with the forecast next to what really arrived), the
+moves it made with their reasons and priorities, the state **after**, and a
+no-rebalancing vs adaptive comparison that includes every deadhead kilometre and
+both wait figures.
+
 Exit codes: `0` success, `1` no route, `2` invalid input or scenario,
 `3` A*/Dijkstra cost mismatch (should never happen).
 
-## 12. How to run tests
+## 13. How to run tests
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -760,9 +1022,9 @@ pip install -r requirements.txt
 pytest -q
 ```
 
-455 test functions (643 cases with parametrization) across models, network,
+562 test functions (772 cases with parametrization) across models, network,
 routing, determinism, edge cases, route-switch regression, and the M2 demand,
-M3 fleet and M4 swarm layers. Highlights: A* and Dijkstra costs match for **all 462 ordered node
+M3 fleet, M4 swarm and M5 rebalancing layers. Highlights: A* and Dijkstra costs match for **all 462 ordered node
 pairs**, and again under random congestion; the heuristic is checked for
 admissibility against true costs from every node to every goal.
 
@@ -819,6 +1081,24 @@ like-for-like. It deliberately asserts nothing about swarm mode being better:
 one test exists specifically to confirm the comparison is free to show swarm mode
 driving further or finishing later.
 
+M5 contributes 107 test functions (129 cases) covering the demand windows, forecast
+determinism and its **refusal to read future trips**, the thin-history guard,
+profile shares, every demand-map column definition, deficit and surplus, every
+eligibility rule including the protection of pods in service, charging and in
+swarms, deterministic matching and its independence from fleet insertion order, the
+priority formula, all three reasons, cycle and concurrency caps, battery refusal,
+unreachable and too-far targets, congestion changing a repositioning route and its
+energy, empty repositioning movement and arrival, a pod's return to service, the
+separation of passenger from repositioning trips, the demand-shift experiment
+(pods reach area B **before** its peak), the controlled before/after comparison, the
+efficiency formula, metrics reconciliation, tick-by-tick and separate-process
+determinism, empty-fleet / zero-trip / no-deficit / no-surplus edge cases, and the
+whole M6 boundary — read-only observation, inert proposals, and a validator that
+rejects out-of-range and unknown parameters. Further tests assert that
+`enable_rebalancing=False` reproduces M4 fingerprint-for-fingerprint, that
+`PodStatus` still has five members, that `TripKind` defaults to passenger, and that
+no lower layer imports `app.rebalancing`.
+
 `tests/test_route_switch_regression.py` (M1.1) pins the end-to-end behaviour that
 congestion can change the chosen route. On the seed-42 baseline,
 North Station -> East Hub is normally `E009 -> E011` via Northgate Junction
@@ -830,7 +1110,7 @@ route is genuinely cheaper under the modified costs, that Dijkstra and A* still
 agree before/after/restored, that repeated executions are bit-identical, and that
 restoring the original traffic restores the original route and cost exactly.
 
-## 13. Known limitations
+## 14. Known limitations
 
 * Synthetic data only; no calibration against real traffic.
 * Vehicle counts are static inputs — there is no traffic propagation, queueing,
@@ -911,19 +1191,55 @@ M4 swarms:
 * Swarm capacity is reported as the sum of member capacities but grants **no
   pooling**: a passenger is never moved between pods, so a full pod and an empty
   one in the same swarm cannot share.
-* Rebalancing is an interface with a naive reference planner, nothing more.
+* Rebalancing is implemented in M5; M4 itself ships only the interface.
 
-## 14. Future milestones
+M5 rebalancing:
+
+* **Rebalancing is a heuristic, not an optimum.** The planner is greedy: it fills
+  the biggest deficit first with the nearest spare pod. Filling a smaller deficit
+  first, or moving a slightly further pod, could serve more trips. No optimality is
+  claimed or attempted.
+* **It is expensive.** On the headline run 8 979 km — 35.8 % of all driving — were
+  driven empty, at 22.17 km per additional trip served. Whether that trade is worth
+  making is a judgement the model does not make for you.
+* **It makes two things worse.** Average wait rose 4.63 → 5.24 min and average
+  completion 28.81 → 31.35 min: repositioning competes for the same pods and adds
+  traffic. Reported, not hidden.
+* **The forecast is crude and no accuracy is claimed.** It is a weighted blend of a
+  recent rate and a published profile share. It has no trend, no seasonality, no
+  day-of-week effect and no uncertainty estimate, and it systematically
+  under-forecasts a rising peak (9.58 against 11 actual in the example above).
+* It assumes the published demand profile is correct. Feed it a scenario whose
+  profile does not match the demand and the profile half of the blend becomes
+  actively misleading.
+* Repositioning targets a node's forecast, not individual trips: a pod may arrive
+  just as the demand it was sent for goes elsewhere.
+* One pod per move, one move at a time. No swarm repositioning, no chaining, and no
+  reconsideration once a pod is under way — a dispatched move always completes even
+  if the reason for it has evaporated.
+* `min_history_min` means nothing is repositioned in the first 15 simulated minutes,
+  so a run that starts at a peak is caught flat-footed.
+* The deadhead energy is M3's approximated battery model, and a repositioning pod
+  earns nothing for the charge it spends.
+
+## 15. Future milestones
 
 * **M1** — deterministic city + network foundation ✅
 * **M1.1** — route-switch regression validation ✅
 * **M2** — deterministic passenger demand model ✅
 * **M3** — deterministic pod fleet simulation ✅
 * **M4** — deterministic swarm formation and platooning ✅
-* **M5** — adaptive fleet rebalancing (next; not started — M4 ships only the hook)
-* Later — predictive demand, AI-assisted control, dashboard, impact comparison.
+* **M4.1** — swarm metric semantics audit ✅
+* **M5** — adaptive fleet rebalancing and the M6 boundary ✅
+* **M6** — AI orchestration layer (next; not started)
+* Later — dashboard, impact comparison.
 
-The eventual pipeline is `passenger demand → trip requests → routing → pod
-grouping → swarm formation`. M1–M4 implement all of it. The obvious next step is
-the limitation M3 exposed and M4 only hooked: moving idle pods to where demand
-actually is.
+**M5 completes the deterministic engine.** Everything up to here is reproducible
+from a seed, uses only the Python standard library, and runs offline. M6 would sit
+*above* it as an orchestrator, observing through §11's read-only snapshot and
+proposing bounded actions that the validator checks before the engine acts — it can
+never mutate simulation state directly.
+
+The pipeline is `passenger demand → trip requests → routing → pod grouping → swarm
+formation`, with rebalancing closing the loop back to demand. M1–M5 implement all of
+it deterministically.

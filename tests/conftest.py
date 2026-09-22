@@ -197,3 +197,71 @@ def make_corridor_fleet(corridor_graph):
             swarm_config=swarm_config or DEFAULT_SWARM_CONFIG, enable_swarms=enable_swarms)
         return fleet, simulation
     return _make
+
+
+# --- M5 rebalancing fixtures -----------------------------------------------
+@pytest.fixture
+def rebalancing_config():
+    from app.rebalancing import DEFAULT_REBALANCING_CONFIG
+    return DEFAULT_REBALANCING_CONFIG
+
+
+@pytest.fixture
+def two_area_graph():
+    """Two demand areas joined by one long link, for the demand-shift experiment.
+
+        A1 <-> A2 <------ 20 km ------> B1 <-> B2
+
+    Within an area a hop is 4 km / 5 min; crossing between them is 20 km / 20 min.
+    Every link is two-way, so pods can be repositioned in either direction.
+    """
+    g = NetworkGraph()
+    coords = {"A1": (0.0, 0.00), "A2": (0.0, 0.03), "B1": (0.0, 0.20), "B2": (0.0, 0.23)}
+    for node_id, (lat, lon) in coords.items():
+        g.add_node(_node(node_id, lat, lon, "station"))
+    links = (("A1", "A2", 4.0, 5.0), ("A2", "B1", 20.0, 20.0), ("B1", "B2", 4.0, 5.0))
+    index = 0
+    for src, dst, km, minutes in links:
+        for a, b in ((src, dst), (dst, src)):
+            index += 1
+            g.add_edge(_edge(f"L{index:02d}", a, b, km, minutes, capacity=1500))
+    return g
+
+
+@pytest.fixture
+def demand_shift_trips():
+    """Demand that starts in area A and moves to area B.
+
+    * t 20-120   : 20 trips A1 -> A2      (area A is busy; pods end up in A)
+    * t 200-220  : 4 trips  B1 -> B2      (the ramp: B demand becomes observable)
+    * t 260-320  : 25 trips B1 -> B2      (the peak the fleet must be ready for)
+
+    A forecast that only reacts to the ramp still has time to move pods across the
+    20 km link before the peak, which is exactly what M5 is meant to demonstrate.
+    """
+    from app.demand.models import TripRequest
+
+    def _trip(index, origin, destination, time_min):
+        return TripRequest(trip_id=f"T{index:06d}", passenger_id=f"P{index:06d}",
+                           origin_node_id=origin, destination_node_id=destination,
+                           request_time_min=float(time_min), party_size=1,
+                           trip_purpose="commute", time_bucket="morning_peak")
+
+    trips, index = [], 0
+    for step in range(20):
+        trips.append(_trip(index, "A1", "A2", 20 + step * 5)); index += 1
+    for step in range(4):
+        trips.append(_trip(index, "B1", "B2", 200 + step * 5)); index += 1
+    for step in range(25):
+        trips.append(_trip(index, "B1", "B2", 260 + step * 2.5)); index += 1
+    return tuple(trips)
+
+
+@pytest.fixture
+def area_a_fleet(two_area_graph):
+    """Ten pods, all parked in area A — the spatial imbalance M5 must fix."""
+    from app.fleet import Pod, PodFleet
+    return PodFleet(two_area_graph, [
+        Pod(pod_id=f"POD{i:05d}", capacity=4, current_node_id="A1" if i < 5 else "A2")
+        for i in range(10)
+    ])

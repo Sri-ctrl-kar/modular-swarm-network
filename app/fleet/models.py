@@ -60,6 +60,20 @@ UNROUTABLE_PREFIX = "unroutable:"
 TIMED_OUT_PREFIX = "no pod available within"
 
 
+class TripKind(str, Enum):
+    """What a pod's current assignment is for.
+
+    Added for M5: a pod may be dispatched **empty** to reposition itself. That is a
+    fleet-level fact (a pod can drive with nobody aboard), so it lives here, while
+    every decision about *when* to reposition stays in ``app/rebalancing/``.
+
+    ``PASSENGER`` is the default everywhere, so existing behaviour is unchanged.
+    """
+
+    PASSENGER = "passenger"          # carrying a party; party_size >= 1
+    REPOSITIONING = "repositioning"  # empty; party_size == 0
+
+
 class TripStatus(str, Enum):
     PENDING = "pending"          # requested, waiting for a pod
     ASSIGNED = "assigned"        # a pod holds it, travel not started
@@ -130,7 +144,11 @@ class Pod:
     total_distance_km: float = 0.0
     total_travel_time_min: float = 0.0
     total_energy_kwh: float = 0.0
+    # Counts PASSENGER arrivals only. Empty repositioning arrivals are counted
+    # separately so they can never inflate a passenger-service figure.
     completed_trip_count: int = 0
+    completed_repositioning_count: int = 0
+    current_trip_kind: TripKind = TripKind.PASSENGER
 
     def __post_init__(self) -> None:
         _require_text(self.pod_id, "pod_id")
@@ -139,6 +157,13 @@ class Pod:
         _require_int(self.occupied_seats, "occupied_seats", minimum=0)
         _require_int(self.route_index, "route_index", minimum=0)
         _require_int(self.completed_trip_count, "completed_trip_count", minimum=0)
+        _require_int(self.completed_repositioning_count, "completed_repositioning_count", minimum=0)
+        try:
+            object.__setattr__(self, "current_trip_kind", TripKind(self.current_trip_kind))
+        except ValueError as exc:
+            allowed = ", ".join(k.value for k in TripKind)
+            raise ModelValidationError(
+                f"current_trip_kind must be one of [{allowed}], got {self.current_trip_kind!r}") from exc
         if self.occupied_seats > self.capacity:
             raise ModelValidationError(
                 f"pod {self.pod_id!r}: occupied_seats ({self.occupied_seats}) "
@@ -180,6 +205,11 @@ class Pod:
         return self.route is not None
 
     @property
+    def is_repositioning(self) -> bool:
+        """True while this pod is driving empty to reposition itself (M5)."""
+        return self.current_trip_kind is TripKind.REPOSITIONING
+
+    @property
     def remaining_edge_ids(self) -> tuple[str, ...]:
         """Edges of the current route not yet completed."""
         if self.route is None:
@@ -219,10 +249,27 @@ class Pod:
             )
         self._set(status=new_status)
 
-    def assign(self, trip_id: str, route: Route, party_size: int) -> None:
-        """Attach a trip and its route. IDLE -> ASSIGNED."""
+    def assign(self, trip_id: str, route: Route, party_size: int,
+               kind: TripKind = TripKind.PASSENGER) -> None:
+        """Attach a trip and its route. IDLE -> ASSIGNED.
+
+        ``kind`` defaults to ``PASSENGER``, which requires a party of at least one
+        and behaves exactly as before. ``REPOSITIONING`` requires a party of
+        **zero**: the pod drives empty, so it can never be mistaken for carrying
+        someone, and no seat is ever occupied by a repositioning move.
+        """
         _require_text(trip_id, "trip_id")
-        _require_int(party_size, "party_size", minimum=1)
+        try:
+            kind = TripKind(kind)
+        except ValueError as exc:
+            allowed = ", ".join(k.value for k in TripKind)
+            raise ModelValidationError(f"kind must be one of [{allowed}], got {kind!r}") from exc
+        if kind is TripKind.REPOSITIONING:
+            if party_size != 0:
+                raise ModelValidationError(
+                    f"a repositioning pod travels empty, so party_size must be 0, got {party_size!r}")
+        else:
+            _require_int(party_size, "party_size", minimum=1)
         if not isinstance(route, Route):
             raise ModelValidationError(f"route must be a Route, got {type(route).__name__}")
         if self.status is not PodStatus.IDLE:
@@ -237,6 +284,7 @@ class Pod:
             )
         self.set_status(PodStatus.ASSIGNED)
         self._set(assigned_trip_id=trip_id, route=route, occupied_seats=party_size,
+                  current_trip_kind=kind,
                   route_index=0, current_edge_id=None, current_edge_time_min=None,
                   current_edge_elapsed_min=0.0, current_edge_distance_km=0.0,
                   current_edge_energy_kwh=0.0)
@@ -327,7 +375,10 @@ class Pod:
                 f"pod {self.pod_id!r} still has {len(self.remaining_edge_ids)} route edge(s) left"
             )
         self.set_status(PodStatus.ARRIVED)
-        self._set(completed_trip_count=self.completed_trip_count + 1)
+        if self.current_trip_kind is TripKind.REPOSITIONING:
+            self._set(completed_repositioning_count=self.completed_repositioning_count + 1)
+        else:
+            self._set(completed_trip_count=self.completed_trip_count + 1)
 
     def release(self) -> str | None:
         """Drop the trip and become IDLE again. Returns the released trip id."""
@@ -336,6 +387,7 @@ class Pod:
         trip_id = self.assigned_trip_id
         self.set_status(PodStatus.IDLE)
         self._set(assigned_trip_id=None, route=None, route_index=0, occupied_seats=0,
+                  current_trip_kind=TripKind.PASSENGER,
                   current_edge_id=None, current_edge_time_min=None, current_edge_elapsed_min=0.0,
                   current_edge_distance_km=0.0, current_edge_energy_kwh=0.0)
         return trip_id
@@ -387,6 +439,8 @@ class Pod:
             "total_travel_time_min": self.total_travel_time_min,
             "total_energy_kwh": self.total_energy_kwh,
             "completed_trip_count": self.completed_trip_count,
+            "completed_repositioning_count": self.completed_repositioning_count,
+            "current_trip_kind": self.current_trip_kind.value,
         }
 
 

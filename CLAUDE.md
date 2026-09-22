@@ -5,8 +5,8 @@ A* admissibility proof and the synthetic-city assumptions.
 
 ## Status
 
-Milestones 1, 1.1, 2, 3 and 4 are complete and green: 455 test functions /
-643 parametrized cases, all passing.
+Milestones 1, 1.1, 2, 3, 4, 4.1 and 5 are complete and green: 562 test functions /
+772 parametrized cases, all passing. **M5 completes the deterministic engine.**
 
 * **M1** — deterministic city + network foundation.
 * **M1.1** — `tests/test_route_switch_regression.py`: congestion can change the
@@ -22,10 +22,13 @@ Milestones 1, 1.1, 2, 3 and 4 are complete and green: 455 test functions /
 * **M4.1** — `tests/test_swarm_metric_semantics.py`: the comparison metrics were
   audited, found numerically correct, and renamed to carry their units; the
   formulas are now pinned by tests.
+* **M5** — `app/rebalancing/`: deterministic demand forecasting, a spatial demand
+  map, eligibility rules, surplus/deficit matching, **empty** pod repositioning
+  with its full deadhead cost, and the read-only M6 boundary.
 
-Next milestone is **M5: adaptive fleet rebalancing** — not started. Do not
-implement adaptive rebalancing, magnetic linking, LLM integration or a dashboard
-yet.
+Next milestone is **M6: the AI orchestration layer** — not started. Do not
+implement Gemini, an LLM, agents, a dashboard or cloud services yet. M6 sits
+*above* the engine and reaches it only through `app/rebalancing/observation.py`.
 
 ## Commands
 
@@ -41,6 +44,7 @@ python -m app.cli.main demand-demo --profile baseline --passengers 1000
 python -m app.cli.main demand-demo --profile peak_hour --passengers 2000 --no-routing
 python -m app.cli.main fleet-demo --pods 100 --passengers 1000
 python -m app.cli.main swarm-demo --pods 100 --passengers 1000
+python -m app.cli.main rebalancing-demo --pods 100 --passengers 1000
 ```
 
 ## Invariants — do not break these
@@ -66,9 +70,9 @@ python -m app.cli.main swarm-demo --pods 100 --passengers 1000
 4. **Assumptions live in `app/config.py`** and the scenario file, not inside
    algorithms. No magic numbers in routing or graph code.
 5. **Layering:** models ← network ← routing ← simulation ← demand ← fleet ←
-   swarm ← cli. Never import downward-to-upward: nothing below a layer may import
-   `app.demand`, `app.fleet` or `app.swarm` (tests walk the lower layers to
-   enforce all three).
+   swarm ← rebalancing ← cli. Never import downward-to-upward: nothing below a
+   layer may import `app.demand`, `app.fleet`, `app.swarm` or `app.rebalancing`
+   (tests walk the lower layers to enforce all four).
 6. **Typed errors only** (`app/errors.py`); the CLI turns them into one clean
    line on stderr with exit code 1 (no route) or 2 (invalid input).
 7. **Synthetic data must stay labelled as synthetic.** No real-world
@@ -106,9 +110,29 @@ python -m app.cli.main swarm-demo --pods 100 --passengers 1000
    simulation's own `swarm_config`, or occupancy gets scored under a factor the
    run never used. Cross-mode raw totals are not like-for-like (the modes serve
    different trips); only `road_occupancy_saving_percent` compares directly.
-12. **Rebalancing stays a hook.** `app/swarm/rebalancing.py` plans and returns
-   `RepositionRequest`s; nothing in M4 executes them, and `plan()` must stay
-   read-only. Adaptive rebalancing is M5.
+12. **`app/swarm/rebalancing.py` stays a hook.** It plans and returns
+   `RepositionRequest`s and must stay read-only. M5's `AdaptiveRebalancer`
+   implements that protocol and is what actually executes.
+13. **The forecast must never read the future.** `build_forecast` sees only trips
+   already requested (the recent window) plus M2's published profile. The
+   simulation holds the whole trip list, so peeking is one line away and would
+   make every number meaningless — a test asserts that adding future trips leaves
+   the forecast byte-identical. `actual_near_future_demand` is evaluation-only and
+   must never become an input.
+14. **Passenger trips and repositioning trips stay separate.** An empty move is
+   `TripKind.REPOSITIONING` with `party_size=0`, creates no `TripRecord`, counts
+   under `completed_repositioning_count`, and its kilometres are reported as
+   deadhead — never netted off a passenger figure. A passenger's pod is never
+   taken: only `IDLE`, non-charging, non-swarmed, sufficiently charged pods move.
+15. **The cost of rebalancing is never hidden.** Deadhead km, minutes and kWh are
+   reported on their own, and the efficiency figure is trips per empty km — not a
+   return on investment. If rebalancing makes wait or completion time worse, say
+   so; two figures currently do get worse and the README states both.
+16. **The M6 boundary stays a boundary.** `observation.py` hands out frozen plain
+   values only — no graph, fleet, pod or simulation. Proposals are inert data,
+   every settable parameter has explicit numeric bounds, and
+   `apply_validated_action` accepts nothing but an already-validated action. The
+   AI must never mutate simulation state directly.
 
 ## The M2 demand layer
 
@@ -178,11 +202,40 @@ The dominant limitation is still M3's: pods only platoon when already co-located
 so on the seed-42 city just 28 swarms form, nearly all of size 2.
 `max_formation_delay_min` is the one threshold that moves that number much.
 
-## When starting M5
+## The M5 rebalancing layer
 
-Adaptive rebalancing is the obvious next step, and M4 already defines its
-interface: implement `FleetRebalancer.plan` properly and give something the right
-to *execute* the requests. That execution is new behaviour — a pod driving empty —
-so it needs its own state or trip representation, its own tests, and honest
-accounting for the empty kilometres it adds. Do not change `app/swarm/` to do it;
-build above it as every milestone so far has.
+`app/rebalancing/` sits on top of `app/swarm/` and is organised as:
+
+| Module | Holds |
+|---|---|
+| `config.py` | every threshold: windows, forecast weights, `min_history_min`, cycle/concurrency caps, battery reserve, priority weights |
+| `eligibility.py` | the pod-protection rules and the battery predicate |
+| `forecast.py` | `DemandWindow`, `build_forecast`, `profile_shares` |
+| `demand_map.py` | `SpatialDemandMap` — forecast against eligible supply, per node |
+| `planner.py` | `AdaptiveRebalancer` — matching, priority, the three reasons |
+| `execution.py` | `RepositionAssignment`, `dispatch`, `complete`, `fail` |
+| `simulation.py` | `RebalancingSimulation`, a `SwarmSimulation` subclass |
+| `metrics.py` | `RebalancingMetrics`, `compare_rebalancing_modes` |
+| `observation.py` | the M6 boundary: `observe`, `ProposedAction`, `ActionValidator` |
+
+`RebalancingSimulation` extends `SwarmSimulation` and overrides one step —
+`_depart_assigned_pods`, to send empty pods off without formation — then appends a
+rebalancing cycle after M4's tick. `enable_rebalancing=False` reproduces M4
+exactly and a test pins that; keep it true, because the before/after experiment
+depends on it. With rebalancing off the engine still *observes* the deficit on the
+same cadence so the two modes compare like for like.
+
+The one edit M5 needed below itself was additive: `TripKind` on `Pod`, so a pod can
+be dispatched empty (`party_size=0`) and its arrivals counted apart from passenger
+arrivals. `PodStatus` is unchanged.
+
+## When starting M6
+
+M6 is the orchestration layer and sits **above** everything. It must reach the
+engine only through `app/rebalancing/observation.py`: read state with `observe()`,
+emit a `ProposedAction`, have `ActionValidator` check it, and let
+`apply_validated_action` act. Do not give an LLM a reference to a graph, fleet,
+pod or simulation, and do not widen `PARAMETER_BOUNDS` without deciding what the
+new bound protects. Anything the validator accepts but M5 refuses to apply
+(scenario switching, comparisons) is M6's to implement — above the engine, not
+inside it. Build a new package; do not modify `app/rebalancing/`.
