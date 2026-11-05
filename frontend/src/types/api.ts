@@ -234,13 +234,41 @@ export interface CycleAuditRecord {
   };
 }
 
+/** One run's own road space, exactly as M4 published it. Never differenced across runs. */
+export interface RoadSpaceEntry {
+  available: boolean;
+  unavailable_reason: string | null;
+  /** equiv-km freed within this run; null when the run drove no distance. */
+  saved_equiv_km: number | null;
+  /** Share of this run's own pod-km; null when undefined. The only cross-run-comparable figure. */
+  saving_percent: number | null;
+  occupancy_equiv_km: number | null;
+  pod_distance_km: number;
+  swarm_count: number;
+  zero_reason: string | null;
+}
+
+export interface RoadSpaceSummary {
+  per_run: {
+    baseline: RoadSpaceEntry;
+    swarm: RoadSpaceEntry;
+    adaptive: RoadSpaceEntry;
+  };
+  /** Always null: a cross-run equiv-km difference is not a coordination effect. */
+  cross_run_difference_equiv_km: null;
+  cross_run_comparable: false;
+  cross_run_note: string;
+  semantics: string;
+  unit: string;
+}
+
 export interface ComparisonResult {
   horizon_min: number;
   baseline: Record<string, any>;
   swarm: Record<string, any>;
   adaptive: Record<string, any>;
   impact_summary: {
-    road_space_saved_equiv_km: number;
+    road_space: RoadSpaceSummary;
     trips_served_gain: number;
     wait_time_reduction_pct: number;
     deadhead_pct: number;

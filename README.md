@@ -1367,9 +1367,10 @@ which is refused as data without ever being interpreted.
 ## 13. The Visual Command Center (M7, M7.2)
 
 > ⚠️ **The screen computes nothing.** Every figure it shows was produced by the
-> M1-M6 engines and is read over HTTP. The API adapter serialises; it holds no cost,
-> congestion, battery, forecasting or scoring model of its own. One exception exists
-> and is a defect, not a design — see §16's note on `/api/comparison`.
+> M1-M6 engines and is read over HTTP. The API adapter serialises and labels; it
+> holds no cost, congestion, battery, forecasting or scoring model of its own, and
+> it does not difference a metric across two runs. Road space in particular is
+> reported per run from M4's published figure — see §16.
 
 ```
      React frontend  ──────────── JSON over /api/* ───────────▶  app/api/server.py
@@ -1915,21 +1916,39 @@ M6 orchestration:
 
 M7 / M7.2 Visual Command Center:
 
-* **`/api/comparison` does not use the engine's road-space metric, and its figure
-  should not be quoted.** The endpoint derives
-  `impact_summary.road_space_saved_equiv_km` as
-  `baseline.pod_distance_km − swarm.pod_distance_km × 0.85`, a hardcoded factor that
-  appears nowhere in the engine, and in doing so differences physical kilometres
-  against a scaled quantity and labels the result `equiv_km` — exactly the unit mix
-  §10 forbids. `ScenarioComparisonModal` displays it. The live `UrbanImpactPanel`,
-  by contrast, reads M4's real `road_occupancy_saved_equiv_km`. Treat the comparison
-  modal's road-space number as unverified presentation, not an engine result, until
-  it is changed to read the published metric.
+* **`/api/comparison` reports road space per run, and never differences it across
+  runs.** `impact_summary.road_space.per_run.{baseline,swarm,adaptive}` carries M4's
+  own `road_occupancy_saved_equiv_km` and `road_occupancy_saving_percent` for that
+  one run, passed through unaltered; `cross_run_difference_equiv_km` is always
+  `null` and `cross_run_comparable` is always `false`. That is deliberate: the three
+  modes serve different trip sets, because the formation delay shifts departures, so
+  subtracting one mode's equiv-km total from another's would not measure
+  coordination (§10 states the rule, and only the scale-free percentage compares
+  across runs). A run that drove no distance is reported `available: false` with a
+  reason, not as a zero.
+* **On the comparison's own fixed spec the honest answer is zero.** With 60 pods,
+  400 passengers and a 180-minute horizon, **no swarm forms at all** in any of the
+  three modes, so every run's saving is exactly `0.0` equiv-km and the response says
+  why in `zero_reason`. On this pod and passenger count the **first formation occurs
+  at simulated minute 372**, in both the swarm and the adaptive mode — the baseline
+  demand profile's morning peak does not begin until minute 360, so a 180-minute
+  horizon ends long before any two pods are ever assigned at the same node.
+  Extending the horizon to a full day gives **1.3 %** of pod-km in the swarm mode
+  and **2.84 %** in the adaptive mode. An earlier version of this endpoint derived
+  the figure from a hardcoded 0.85 factor instead of the engine's metric and
+  consequently displayed about 44 equiv-km of road space "freed" where the engine's
+  own figure was 0.000. That formula has been removed, a
+  regression test asserts the flat scalar cannot reappear, and the figures above are
+  what the engine actually produces.
 * **No road-space reduction has been achieved, measured or demonstrated here.** The
   "up to 40 %" figure the UI mentions is a prospective planning assumption resting on
   a theoretical headway-compression factor, and the panel says so on screen. §10's
   occupancy saving is an estimate derived from `formation_occupancy_factor` and is
-  explicitly not an aerodynamic, fuel, energy or emissions saving.
+  explicitly not an aerodynamic, fuel, energy or emissions saving. The largest
+  road-space saving this repository has actually measured on the comparison's pod and
+  passenger count is **4.71 %** (adaptive mode, 600-minute horizon) — an order of
+  magnitude below the prospective target, and reported as measured rather than
+  aspired to.
 * **No live Gemini call has been made from this repository's own verification runs.**
   `$GEMINI_API_KEY` was unset throughout, so the live provider's network path is
   exercised only through an injected stub client; everything reported was produced by
@@ -1975,9 +1994,9 @@ M7 / M7.2 Visual Command Center:
 * **M6** — Gemini orchestration and validated AI control ✅
 * **M7** — stdlib HTTP adapter and the React Visual Command Center ✅
 * **M7.2** — deterministic Demo Mode and the derived event feed ✅
-* Not started — nothing beyond M7.2. The nearest known work is correcting
-  `/api/comparison` to read M4's published occupancy metric instead of its hardcoded
-  factor (§16), and an end-to-end test across the server and the real UI.
+* Not started — nothing beyond M7.2. The nearest known work is an end-to-end test
+  across the server and the real UI, so the contract between `src/types/api.ts` and
+  the server's JSON stops being maintained by hand (§16).
 
 **M5 completes the deterministic engine. M6 is the only thing that proposes, and M7
 is the only thing that displays.** Everything through M5 is reproducible from a seed,

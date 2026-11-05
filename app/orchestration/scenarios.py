@@ -45,6 +45,7 @@ from app.network.synthetic_city import build_synthetic_city
 from app.rebalancing.config import DEFAULT_REBALANCING_CONFIG, RebalancingConfig
 from app.rebalancing.metrics import compute_rebalancing_metrics
 from app.rebalancing.simulation import RebalancingSimulation
+from app.swarm.metrics import compute_swarm_metrics
 
 DEFAULT_CITY_SEED = 42
 DEFAULT_FLEET_SEED = 42
@@ -113,7 +114,29 @@ def build_simulation(spec: ScenarioSpec, fleet_config: FleetConfig = DEFAULT_FLE
 
 @dataclass(frozen=True)
 class ScenarioResult:
-    """One deterministic run's outcome, as plain values."""
+    """One deterministic run's outcome, as plain values.
+
+    ROAD SPACE — units and scope
+    ----------------------------
+    The three ``road_occupancy_*`` fields are M4's own figures for **this run**,
+    taken from ``compute_swarm_metrics`` without alteration (see
+    ``app/swarm/metrics.py`` for their formulas). They are carried here so a caller
+    never has to re-derive road space from distance, which is how a hardcoded
+    factor once crept into the API's comparison endpoint.
+
+    * ``road_occupancy_equiv_km`` — estimated road space used, in
+      single-pod-equivalent km. With no formations it is **identically**
+      ``pod_distance_km``.
+    * ``road_occupancy_saved_equiv_km`` — ``pod_distance_km − road_occupancy_equiv_km``
+      for this run; exactly ``0.0`` when no swarm formed.
+    * ``road_occupancy_saving_percent`` — the saving as a share of this run's own
+      pod-km, or ``None`` when the run drove no distance at all (undefined, not
+      zero). Being scale-free, it is the **only** one of the three that M4 permits
+      to be compared across two runs.
+
+    Never difference a ``*_equiv_km`` field across two runs: the runs serve
+    different trip sets, so the difference is not a coordination effect.
+    """
 
     spec: ScenarioSpec
     end_time_min: float
@@ -127,6 +150,10 @@ class ScenarioResult:
     total_energy_kwh: float
     completed_repositions: int
     final_total_deficit: float
+    road_occupancy_equiv_km: float
+    road_occupancy_saved_equiv_km: float
+    road_occupancy_saving_percent: float | None
+    swarm_count: int
 
     def to_dict(self) -> dict[str, Any]:
         data = {name: getattr(self, name) for name in self.__dataclass_fields__
@@ -145,6 +172,9 @@ def run_scenario(spec: ScenarioSpec, *, max_ticks: int = 100_000,
     fleet_metrics = compute_fleet_metrics(simulation.fleet, simulation.records(),
                                           simulation.time_min)
     rebalancing_metrics = compute_rebalancing_metrics(simulation)
+    # Defaults to the simulation's own swarm_config, so occupancy is never scored
+    # under a factor this run did not use (M4's rule).
+    swarm_metrics = compute_swarm_metrics(simulation)
     return ScenarioResult(
         spec=spec,
         end_time_min=round(simulation.time_min, 4),
@@ -158,6 +188,10 @@ def run_scenario(spec: ScenarioSpec, *, max_ticks: int = 100_000,
         total_energy_kwh=fleet_metrics.total_energy_kwh,
         completed_repositions=rebalancing_metrics.completed_repositions,
         final_total_deficit=rebalancing_metrics.final_total_deficit,
+        road_occupancy_equiv_km=swarm_metrics.road_occupancy_equiv_km,
+        road_occupancy_saved_equiv_km=swarm_metrics.road_occupancy_saved_equiv_km,
+        road_occupancy_saving_percent=swarm_metrics.road_occupancy_saving_percent,
+        swarm_count=swarm_metrics.swarm_count,
     )
 
 

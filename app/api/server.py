@@ -339,6 +339,70 @@ class _DemoBusy(Exception):
     """Raised for requests that are not valid in the current demo state (HTTP 409)."""
 
 
+#: Why a cross-run road-space *difference* is never reported. M4 states the rule:
+#: two modes serve different trip sets (formation delay shifts departures), so the
+#: difference between their ``*_equiv_km`` totals is not a coordination effect.
+#: Only ``road_occupancy_saving_percent``, being scale-free, compares across runs.
+ROAD_SPACE_NOT_COMPARABLE = (
+    "A cross-run road-space difference is not reported. The modes serve different "
+    "trip sets, so differencing their equiv-km totals would not measure "
+    "coordination. Each run's own saving is given below; only the percentages are "
+    "comparable between runs."
+)
+
+ROAD_SPACE_SEMANTICS = (
+    "saved_equiv_km = pod_distance_km - road_occupancy_equiv_km, computed by M4 "
+    "within a single run, in single-pod-equivalent km. It is a road-space estimate "
+    "resting on formation_occupancy_factor, not a fuel, energy, emissions or time "
+    "saving. With no formations it is exactly 0.0."
+)
+
+
+def _road_space_entry(result: Any) -> dict[str, Any]:
+    """One run's own road-space figures, straight from M4. Nothing is derived here.
+
+    ``available`` is false only when the run drove no distance at all, in which case
+    M4's percentage is ``None`` (undefined) rather than zero and there is no road
+    space to report.
+    """
+    available = result.pod_distance_km > 0.0
+    return {
+        "available": available,
+        "unavailable_reason": None if available else
+            "the run drove no distance, so road space is undefined",
+        "saved_equiv_km": result.road_occupancy_saved_equiv_km if available else None,
+        "saving_percent": result.road_occupancy_saving_percent,
+        "occupancy_equiv_km": result.road_occupancy_equiv_km if available else None,
+        "pod_distance_km": result.pod_distance_km,
+        "swarm_count": result.swarm_count,
+        "zero_reason": (
+            "no swarm formed in this run, so coordination freed no road space"
+            if available and result.swarm_count == 0 else None),
+    }
+
+
+def _road_space_summary(baseline: Any, swarm: Any, adaptive: Any) -> dict[str, Any]:
+    """Per-run road space from M4's published metric, with no cross-run arithmetic.
+
+    The baseline has swarms disabled, so its occupancy is identically its pod
+    distance and its saving is exactly 0.0 — an identity M4 asserts, not a
+    coincidence. The swarm and adaptive runs report whatever their own formations
+    actually freed, which is ``0.0`` when none formed.
+    """
+    return {
+        "per_run": {
+            "baseline": _road_space_entry(baseline),
+            "swarm": _road_space_entry(swarm),
+            "adaptive": _road_space_entry(adaptive),
+        },
+        "cross_run_difference_equiv_km": None,
+        "cross_run_comparable": False,
+        "cross_run_note": ROAD_SPACE_NOT_COMPARABLE,
+        "semantics": ROAD_SPACE_SEMANTICS,
+        "unit": "equiv-km (single-pod-equivalent road space)",
+    }
+
+
 def _reject_if_demo(session: "SimulationSession", action: str) -> None:
     if session.demo is not None and session.demo.status in ("running", "paused"):
         raise _DemoBusy(f"Cannot {action} while Demo Mode is in progress; reset first")
@@ -785,9 +849,7 @@ class VisualCommandCenterHandler(BaseHTTPRequestHandler):
         res_s = run_scenario(spec_swarm)
         res_a = run_scenario(spec_adaptive)
 
-        # Calculate road space saved from swarm vs baseline
-        # In baseline (no swarms), road_occupancy_equiv_km == pod_distance_km
-        road_space_saved = round(max(0.0, res_b.pod_distance_km - (res_s.pod_distance_km * 0.85)), 2)
+        road_space = _road_space_summary(res_b, res_s, res_a)
 
         self._send_json({
             "horizon_min": 180.0,
@@ -795,7 +857,7 @@ class VisualCommandCenterHandler(BaseHTTPRequestHandler):
             "swarm": res_s.to_dict(),
             "adaptive": res_a.to_dict(),
             "impact_summary": {
-                "road_space_saved_equiv_km": road_space_saved,
+                "road_space": road_space,
                 "trips_served_gain": res_a.trips_served - res_b.trips_served,
                 "wait_time_reduction_pct": round((1.0 - (res_a.average_wait_min or 1.0) / (res_b.average_wait_min or 1.0)) * 100, 1) if res_b.average_wait_min else 0.0,
                 "deadhead_pct": round((res_a.deadhead_distance_km / res_a.pod_distance_km) * 100, 1) if res_a.pod_distance_km > 0 else 0.0,

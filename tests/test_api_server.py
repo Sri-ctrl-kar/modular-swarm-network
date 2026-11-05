@@ -175,4 +175,148 @@ def test_demand_map_serialization() -> None:
     assert "top_od_flows" in data
 
 
+# --- /api/comparison road space -----------------------------------------------
+# These pin the fix for a defect: the endpoint used to report road space as
+#   max(0, baseline.pod_distance_km - swarm.pod_distance_km * 0.85)
+# a hardcoded factor found nowhere in the engine, which differenced physical km
+# against a scaled quantity and labelled the result equiv-km. On the endpoint's own
+# fixed spec it produced 44.029 equiv-km while M4's real figure was 0.000, because
+# no swarm forms inside the 180-minute horizon. The rules below are what replaced it.
+def _spec(name: str, *, swarms: bool, rebalancing: bool = False,
+          pods: int = 60, passengers: int = 400, horizon: float | None = 180.0):
+    from app.orchestration import ScenarioSpec
+    return ScenarioSpec(name, profile_name="baseline", pods=pods, passengers=passengers,
+                        enable_swarms=swarms, enable_rebalancing=rebalancing,
+                        horizon_min=horizon)
 
+
+def test_scenario_result_carries_m4s_own_road_space() -> None:
+    """The runner must publish the canonical metric, not leave callers to derive it."""
+    from app.orchestration import run_scenario
+    from app.orchestration.scenarios import build_simulation
+    from app.swarm.metrics import compute_swarm_metrics
+
+    spec = _spec("canonical", swarms=True)
+    result = run_scenario(spec)
+
+    simulation = build_simulation(spec)
+    simulation.run(until_min=spec.horizon_min)
+    expected = compute_swarm_metrics(simulation)
+
+    assert result.road_occupancy_equiv_km == expected.road_occupancy_equiv_km
+    assert result.road_occupancy_saved_equiv_km == expected.road_occupancy_saved_equiv_km
+    assert result.road_occupancy_saving_percent == expected.road_occupancy_saving_percent
+    assert result.swarm_count == expected.swarm_count
+
+
+def test_road_space_baseline_without_swarms_is_exactly_zero() -> None:
+    """M4's identity: with no formations, occupancy == pod distance, so saving is 0.0."""
+    from app.api.server import _road_space_entry
+    from app.orchestration import run_scenario
+
+    result = run_scenario(_spec("no_swarms", swarms=False))
+    assert result.swarm_count == 0
+    assert result.road_occupancy_equiv_km == result.pod_distance_km
+    assert result.road_occupancy_saved_equiv_km == 0.0
+
+    entry = _road_space_entry(result)
+    assert entry["available"] is True
+    assert entry["saved_equiv_km"] == 0.0
+    assert entry["saving_percent"] == 0.0
+    assert entry["zero_reason"] is not None and "no swarm formed" in entry["zero_reason"]
+
+
+def test_road_space_in_a_swarm_run_matches_the_closed_form() -> None:
+    """A run that really platoons: the saving must equal sum d*(n-1)*(1-f) exactly."""
+    from app.api.server import _road_space_entry
+    from app.orchestration import run_scenario
+    from app.orchestration.scenarios import build_simulation
+
+    spec = _spec("swarming", swarms=True, horizon=900.0)
+    simulation = build_simulation(spec)
+    simulation.run(until_min=spec.horizon_min)
+    swarms = simulation.swarms()
+    assert swarms, "this scenario is meant to form swarms; re-tune it if it stops"
+
+    factor = simulation.swarm_config.formation_occupancy_factor
+    closed_form = sum(s.shared_distance_km * (s.size - 1) * (1.0 - factor) for s in swarms)
+
+    result = run_scenario(spec)
+    assert result.swarm_count == len(swarms)
+    assert result.road_occupancy_saved_equiv_km == pytest.approx(closed_form, abs=1e-3)
+    assert result.road_occupancy_saved_equiv_km > 0.0
+
+    entry = _road_space_entry(result)
+    assert entry["available"] is True
+    assert entry["zero_reason"] is None
+    assert entry["saved_equiv_km"] == result.road_occupancy_saved_equiv_km
+    assert entry["saving_percent"] == result.road_occupancy_saving_percent
+
+
+def test_road_space_is_unavailable_when_nothing_drove() -> None:
+    """No distance driven -> road space undefined, reported as unavailable not zero."""
+    from app.api.server import _road_space_entry
+    from app.orchestration import run_scenario
+
+    result = run_scenario(_spec("nothing_moved", swarms=True, pods=5, passengers=5,
+                                horizon=1.0))
+    assert result.pod_distance_km == 0.0
+    assert result.road_occupancy_saving_percent is None
+
+    entry = _road_space_entry(result)
+    assert entry["available"] is False
+    assert entry["saved_equiv_km"] is None
+    assert entry["occupancy_equiv_km"] is None
+    assert entry["saving_percent"] is None
+    assert entry["unavailable_reason"] is not None
+
+
+def test_road_space_summary_never_differences_across_runs() -> None:
+    """The cross-run delta the old formula faked must stay absent and marked so."""
+    from app.api.server import _road_space_summary
+    from app.orchestration import run_scenario
+
+    baseline = run_scenario(_spec("b", swarms=False))
+    swarm = run_scenario(_spec("s", swarms=True))
+    adaptive = run_scenario(_spec("a", swarms=True, rebalancing=True))
+
+    summary = _road_space_summary(baseline, swarm, adaptive)
+    assert summary["cross_run_difference_equiv_km"] is None
+    assert summary["cross_run_comparable"] is False
+    assert "not reported" in summary["cross_run_note"]
+    assert set(summary["per_run"]) == {"baseline", "swarm", "adaptive"}
+    assert summary["per_run"]["baseline"]["saved_equiv_km"] == 0.0
+    assert "equiv-km" in summary["unit"]
+
+
+def test_comparison_response_has_no_invented_road_space_figure() -> None:
+    """The response must not reintroduce a flat road_space_saved_equiv_km scalar."""
+    from app.api.server import VisualCommandCenterHandler
+
+    handler = VisualCommandCenterHandler.__new__(VisualCommandCenterHandler)
+    captured: dict = {}
+    handler._send_json = lambda data, status=200: captured.update({"data": data,
+                                                                   "status": status})
+    handler._handle_comparison()
+    assert captured["status"] == 200
+    impact = captured["data"]["impact_summary"]
+
+    assert "road_space_saved_equiv_km" not in impact
+    road_space = impact["road_space"]
+    assert road_space["cross_run_comparable"] is False
+    for mode in ("baseline", "swarm", "adaptive"):
+        entry = road_space["per_run"][mode]
+        assert entry["saved_equiv_km"] is None or entry["saved_equiv_km"] >= 0.0
+    # The engine's truth for this fixed spec: no formations inside 180 minutes.
+    assert road_space["per_run"]["swarm"]["swarm_count"] == 0
+    assert road_space["per_run"]["swarm"]["saved_equiv_km"] == 0.0
+
+
+def test_comparison_response_is_json_serialisable() -> None:
+    from app.api.server import VisualCommandCenterHandler
+
+    handler = VisualCommandCenterHandler.__new__(VisualCommandCenterHandler)
+    captured: dict = {}
+    handler._send_json = lambda data, status=200: captured.update({"data": data})
+    handler._handle_comparison()
+    assert json.loads(json.dumps(captured["data"])) == captured["data"]

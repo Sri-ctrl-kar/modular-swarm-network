@@ -86,15 +86,40 @@ export const ScenarioComparisonModal: React.FC<ScenarioComparisonModalProps> = (
                 </div>
 
                 <div className="bg-[#121824] border border-slate-800 rounded p-3 flex flex-col justify-between">
-                  <span className="text-[10px] text-slate-500 uppercase">Road Space Freed</span>
-                  <div className="text-xl font-bold text-cyan-400 flex items-center gap-1 mt-1">
-                    <ArrowDownRight className="w-5 h-5" />
-                    {data.impact_summary.road_space_saved_equiv_km.toFixed(1)}{' '}
-                    <span className="text-xs font-normal text-slate-400">equiv-km</span>
-                  </div>
-                  <span className="text-[10px] text-slate-400 mt-1">
-                    Via 0.4 headway swarm platooning
+                  <span className="text-[10px] text-slate-500 uppercase">
+                    Road Space Freed (swarm run)
                   </span>
+                  {(() => {
+                    const rs = data.impact_summary.road_space.per_run.swarm;
+                    if (!rs.available || rs.saved_equiv_km === null) {
+                      return (
+                        <>
+                          <div className="text-xl font-bold text-slate-500 mt-1">n/a</div>
+                          <span className="text-[10px] text-slate-400 mt-1">
+                            {rs.unavailable_reason ?? 'not available for this run'}
+                          </span>
+                        </>
+                      );
+                    }
+                    return (
+                      <>
+                        <div className="text-xl font-bold text-cyan-400 flex items-center gap-1 mt-1">
+                          <ArrowDownRight className="w-5 h-5" />
+                          {rs.saved_equiv_km.toFixed(1)}{' '}
+                          <span className="text-xs font-normal text-slate-400">equiv-km</span>
+                          {rs.saving_percent !== null && (
+                            <span className="text-xs font-normal text-slate-400">
+                              ({rs.saving_percent.toFixed(2)}%)
+                            </span>
+                          )}
+                        </div>
+                        <span className="text-[10px] text-slate-400 mt-1">
+                          {rs.zero_reason ??
+                            `M4 estimate within the swarm run, from ${rs.swarm_count} formation(s)`}
+                        </span>
+                      </>
+                    );
+                  })()}
                 </div>
 
                 <div className="bg-[#121824] border border-slate-800 rounded p-3 flex flex-col justify-between">
@@ -193,6 +218,8 @@ export const ScenarioComparisonModal: React.FC<ScenarioComparisonModalProps> = (
                 <p>
                   Comparing two modes reflects full fleet interaction rather than an isolated vehicle effect. Swarm pods wait up to formation delay threshold before departing, and empty rebalancing introduces honest deadhead mileage without concealing energy or road occupancy costs.
                 </p>
+                <p>{data.impact_summary.road_space.cross_run_note}</p>
+                <p className="text-slate-500">{data.impact_summary.road_space.semantics}</p>
               </div>
             </>
           ) : null}
