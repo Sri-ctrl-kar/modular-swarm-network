@@ -45,6 +45,7 @@ from app.fleet.models import (
     FleetSnapshot,
     Pod,
     PodStatus,
+    TripKind,
     TripRecord,
     TripStatus,
 )
@@ -64,7 +65,7 @@ __all__ = [
     "DEPOT_ROLE_WEIGHTS", "FLEET_PROVENANCE", "FleetConfig", "FleetMetrics", "FleetSimulation",
     "FleetSnapshot", "MovementEvent", "NO_BATTERY", "NO_CAPACITY", "NO_POD_AT_ORIGIN", "Pod",
     "PodFleet", "PodStatus", "RunReport", "TIMED_OUT_PREFIX", "TickReport", "TripRecord",
-    "TripStatus", "UNROUTABLE_PREFIX", "advance_pod", "assign_trip", "candidate_pods",
+    "TripKind", "TripStatus", "UNROUTABLE_PREFIX", "advance_pod", "assign_trip", "candidate_pods",
     "compute_fleet_metrics", "depot_weights", "edge_sample", "eligible_pods",
     "estimated_route_battery_percent", "estimated_route_energy_kwh", "generate_fleet",
     "pod_id_for", "select_pod", "start_pod_travel",

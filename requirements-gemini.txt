@@ -1,0 +1,11 @@
+# OPTIONAL — live Gemini mode only (M6).
+#
+# The simulation engine (M1-M5) and the whole orchestration layer's mock path need
+# NOTHING from this file: the runtime is Python 3.11+ standard library only, and the
+# test suite never makes an API call. Install this only to run
+#
+#     python -m app.cli.main ai-demo --provider gemini
+#
+# which also needs an API key in $GEMINI_API_KEY. The SDK is imported inside
+# GeminiProvider.__init__, so importing app.orchestration without it works fine.
+google-genai>=1.0.0
