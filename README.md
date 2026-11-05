@@ -1,18 +1,29 @@
-# Modular Swarm Network — Milestones 1 through 6
+# Modular Swarm Network — Milestones 1 through 7.2
 
 **A fully deterministic city, demand, fleet, platooning and adaptive-rebalancing
-simulation (M1-M5), plus an AI orchestration layer that can only propose bounded
-actions to it (M6).**
+simulation (M1-M5); an AI orchestration layer that can only propose bounded actions
+to it (M6); and a Visual Command Center — a standard-library HTTP adapter and a
+React frontend — that watches and drives it (M7, M7.2).**
 
 There is no machine learning and no LLM anywhere in the engine. M6 adds an optional
 orchestrator *above* it — **Gemini is an orchestrator, not the simulation engine**
-(§12) — and the engine runs exactly as before with no provider at all.
+(§12) — and the engine runs exactly as before with no provider at all. M7 adds a
+screen on top of that; it reads the engine and sends operator inputs, and computes
+nothing of its own (§13).
 
-> ⚠️ **All data in this milestone is SYNTHETIC.** The city, coordinates, distances,
-> capacities and traffic counts are invented. Nothing here claims real-world
-> transportation performance.
+Tagged `v0.7.2-demo` at commit `12515ae`.
 
-## 1. What M1-M5 do
+> ⚠️ **All data in this project is SYNTHETIC.** The city, coordinates, distances,
+> capacities and traffic counts are invented. Nothing here is calibrated against
+> real traffic, real mobility data or any real city, and nothing here claims
+> real-world transportation performance.
+
+> ⚠️ **Without `$GEMINI_API_KEY` everything runs in MOCK GEMINI mode**, which is a
+> fixed arithmetic rule standing in for a model — not a language model, and not a
+> prediction of what Gemini would choose (§12.7, §13.5). The UI labels which mode is
+> live, and no live Gemini call has been made from this repository's own runs.
+
+## 1. What this project does
 
 M1 answers one question reliably and reproducibly:
 
@@ -34,6 +45,14 @@ M5 adds a fifth, and answers the limitation M3 exposed:
 
 > *Demand has moved. Which idle pods should drive empty toward where it is going, what does that repositioning cost, and is it worth it?*
 
+M6 adds a sixth, and is the first layer that is not deterministic end to end:
+
+> *Given a read-only snapshot of all of the above, which bounded action is worth proposing — and does a deterministic validator agree the engine may take it?*
+
+M7 and M7.2 add a seventh, which is a presentation question rather than a modelling one:
+
+> *Can an operator watch all of this happen, drive it, and see what the engine actually did — without the screen computing, inventing or smoothing anything?*
+
 It provides validated node/edge models, a directed weighted graph with dynamic
 (traffic-dependent) costs, a transparent congestion model, Dijkstra and A*
 routing with a proven-admissible heuristic, a seeded synthetic city, a
@@ -41,24 +60,46 @@ human-readable scenario file, a minimal simulation state, and a CLI.
 
 ## 2. What this project deliberately does NOT do
 
-No magnetic linking, no dashboard or animation, no route caching, no real map data,
-no cloud services, no autonomous agents and no arbitrary code execution. **The
-engine (M1-M5) contains no AI of any kind**: M5 defines the boundary an orchestrator
-sits above (§11), and M6 sits above it (§12) without changing a line of it.
+No magnetic linking, no route caching, no real map data, no cloud services, no
+database, no autonomous agents and no arbitrary code execution. **The engine
+(M1-M5) contains no AI of any kind**: M5 defines the boundary an orchestrator sits
+above (§11), and M6 sits above it (§12) without changing a line of it.
 
-The runtime uses **only the Python standard library** and works fully offline. That
-is still true with M6 installed: the Google GenAI SDK is an optional extra
-(`requirements-gemini.txt`), imported inside `GeminiProvider.__init__`, and neither
-the engine nor the test suite ever needs it or an API key.
+**All Python here is standard library.** That includes the M7 API server, which is
+built on `http.server` — there is no FastAPI, Flask, Django or `requests` anywhere
+under `app/`, and `requirements.txt` installs pytest and nothing else. Two bounded
+exceptions sit outside that rule:
+
+* the optional Google GenAI SDK (`requirements-gemini.txt`), imported inside
+  `GeminiProvider.__init__` and never needed by the engine, the mock path or the
+  test suite;
+* the frontend's npm toolchain (React, Vite, Tailwind, vitest), which is a separate
+  build that Python never imports.
+
+So the engine, the CLI and `pytest -q` all work offline on a checkout where
+`frontend/` was never touched and no API key exists.
 
 ## 3. Architecture
 
 ```
-                 ┌────────────────────────────┐
-                 │  app/cli/main.py  (argparse)│   stdout = results, stderr = logs/errors
-                 └──────────────┬─────────────┘
-                                │
-          ┌─────────────────────▼─────────────────────┐
+   ┌────────────────────────────────┐   ┌────────────────────────────┐
+   │ frontend/  (M7)  React + Vite  │   │ app/cli/main.py (argparse) │
+   │  App.tsx  map/  panels/        │   │  route · demand-demo ·     │
+   │  api/client.ts  components/    │   │  fleet/swarm/rebalancing/  │
+   │  holds NO simulation logic     │   │  ai-demo · export-scenario │
+   └───────────────┬────────────────┘   └──────────────┬─────────────┘
+                   │  JSON over HTTP, /api/*           │ stdout = results
+                   ▼                                   │ stderr = logs/errors
+   ┌───────────────────────────────────────────┐        │
+   │ app/api/  (M7, M7.2)   stdlib http.server │        │
+   │  server.py  routes + serialisation        │        │
+   │  demo.py    deterministic Demo Mode       │        │
+   │  events.py  events derived from state     │        │
+   │  adapts only; computes no model of its own│        │
+   └─────────────────────┬─────────────────────┘        │
+                         └──────────┬───────────────────┘
+                                    │
+          ┌─────────────────────────▼─────────────────┐
           │ app/orchestration/  (M6)                  │  observe -> propose ->
           │  config.py  observation.py  actions.py    │  validate -> execute -> record
           │  validator.py  execution.py  scenarios.py │  the AI proposes only; it
@@ -119,11 +160,15 @@ the engine nor the test suite ever needs it or an API key.
 ```
 
 Dependencies point downward only:
-`models ← network ← routing ← simulation ← demand ← fleet ← swarm ← rebalancing ← cli`.
+`models ← network ← routing ← simulation ← demand ← fleet ← swarm ← rebalancing ←
+orchestration ← {cli, api} ← frontend`.
 Each layer consumes the ones below and is imported by none of them; tests walk the
-lower packages to enforce that none of `app.demand`, `app.fleet`, `app.swarm` or
-`app.rebalancing` is imported downward. A future M6 orchestrator sits above the
-whole stack and reaches it only through §11's read-only observation and validator.
+lower packages to enforce that none of `app.demand`, `app.fleet`, `app.swarm`,
+`app.rebalancing` or `app.orchestration` is imported downward. `app/cli/` and
+`app/api/` are siblings at the top of the Python stack — neither imports the other,
+and nothing under `app/` imports `app.api`. The M6 orchestrator reaches the engine
+only through §11's read-only observation and validator, and the frontend reaches
+Python only over HTTP.
 
 ## 4. Data models
 
@@ -933,7 +978,8 @@ without acting — so `average deficit` is a like-for-like comparison.
 
 ### The M6 boundary — defined here, not implemented here
 
-`app/rebalancing/observation.py` defines where a future orchestrator would attach:
+`app/rebalancing/observation.py` defines where an orchestrator attaches — M5 ships
+the boundary and no orchestrator; M6 (§12) is what attaches to it:
 
 ```
 DATA → DETERMINISTIC SIMULATION → METRICS → (M6 ORCHESTRATOR)
@@ -1291,14 +1337,22 @@ fixed and reviewable. A live model's output is recorded for reading and never
 asserted: a test suite that demands a particular sentence from a language model is
 testing the weather.
 
-### 12.12 The API boundary for a future UI
+### 12.12 The API boundary the UI sits on
 
 `app/orchestration/api.py` is pure Python — no HTTP, no framework, no server — and
 exposes exactly what a front end needs: `get_observation`, `propose_action`,
 `validate_action`, `execute_action`, `get_result`, `get_audit_log`. Everything in and
-out is JSON-serialisable plain values, so an HTTP adapter over it would be a
-translation layer with no logic of its own. **The dashboard is not built in this
-milestone.**
+out is JSON-serialisable plain values.
+
+**M7 is that adapter** (§13): `app/api/server.py` holds a `SimulationSession` whose
+`api` attribute is one of these objects, and every orchestrator route is a thin
+translation onto these six operations — `/api/orchestrator/cycle` calls
+`propose_action`, `validate` and `execute` call their namesakes, and observation,
+result and audit are straight pass-throughs. The cycle route adds a few convenience
+fields (a passed-checks count, the execution status and detail, a flattened move
+list), each re-presenting data already in the audit record rather than computing
+anything new. So the frontend reaches the orchestrator through exactly the same
+façade a Python caller would.
 
 ### 12.13 Security
 
@@ -1310,9 +1364,152 @@ include hostile payloads — terminal escape sequences in a reason string, an
 which is refused as data without ever being interpreted.
 
 
-## 13. How to run
+## 13. The Visual Command Center (M7, M7.2)
 
-Python 3.11+. No installation is needed for the runtime.
+> ⚠️ **The screen computes nothing.** Every figure it shows was produced by the
+> M1-M6 engines and is read over HTTP. The API adapter serialises; it holds no cost,
+> congestion, battery, forecasting or scoring model of its own. One exception exists
+> and is a defect, not a design — see §16's note on `/api/comparison`.
+
+```
+     React frontend  ──────────── JSON over /api/* ───────────▶  app/api/server.py
+     (no simulation logic)                                            │
+                                                                      ▼
+                                              app/orchestration/api.py (M6 façade)
+                                                                      │
+                                              M1-M5 deterministic engine
+```
+
+### 13.1 The API adapter
+
+`app/api/` is standard library only: `http.server.ThreadingHTTPServer`, `json`,
+`urllib.parse`, `mimetypes`. `DualStackServer` binds `::` and falls back to IPv4.
+`python -m app.api.server` serves on port 8000 by default (`--host`, `--port`).
+
+| Module | Holds |
+|---|---|
+| `server.py` | `SimulationSession`, `VisualCommandCenterHandler`, `run_server` |
+| `demo.py` | `DemoRunner`, the phases, the impact metrics and the demo's constants |
+| `events.py` | `EventDeriver`, the event kinds and their thresholds |
+
+**GET** `/api` and `/api/health`, `/api/network`, `/api/scenarios`,
+`/api/simulation/state`, `/api/simulation/events`, `/api/demo/state`,
+`/api/demand-map`, `/api/orchestrator/observation`, `/api/orchestrator/audit`,
+`/api/orchestrator/result`, `/api/comparison`. Anything else under `/api/` is a 404;
+anything outside it is served from `frontend/dist/`.
+
+**POST** `/api/simulation/init`, `/api/simulation/step`, `/api/simulation/reset`,
+`/api/simulation/set-traffic`, `/api/route-switch`, `/api/orchestrator/cycle`,
+`/api/orchestrator/validate`, `/api/orchestrator/execute`, `/api/demo/start`,
+`/api/demo/advance`, `/api/demo/pause`, `/api/demo/resume`.
+
+There is **one process-wide session**, guarded by a creation lock and an `RLock`
+held across each mutating request, so two concurrent requests cannot tick the same
+engine and break determinism. `/api/simulation/reset` re-initialises the current
+scenario to its exact starting state and leaves Demo Mode.
+
+`/api/scenarios` lists `baseline`, `peak_hour` and `DEMO_MORNING_RUSH`, plus M6's
+three evaluation scenarios (`A_LARGE_DEFICIT`, `B_NO_DEFICIT`, `C_EXPENSIVE`) with
+the consideration each one is expected to provoke.
+
+### 13.2 Deterministic Demo Mode
+
+Demo Mode is **a script of inputs, not a recording and not a timer.** It starts from
+a fully specified state — `DEMO_MORNING_RUSH`, 40 pods, 600 passengers, from minute
+360.0, the quiet minutes before the morning ramp — then injects operator inputs into
+the real simulation (one traffic injection at 150 % of an edge's capacity, one
+orchestrator cycle) and *waits* for the matching derived event.
+
+Progress is counted in beats, not seconds: 2 ticks per beat, at most 45 beats per
+phase, a 2-beat quiet baseline and a 10-beat settling window at the end. The eight
+phases are `BASELINE`, `DEMAND_SURGE`, `CONGESTION`, `ROUTING`, `SWARM`,
+`REBALANCING`, `GEMINI`, `IMPACT`.
+
+Each phase names the events that gate it. **A phase is marked `complete` only once
+those events have actually been derived from real state; if its beat budget runs out
+first it is marked `not_observed` and the machine moves on.** Nothing is faked to
+make a phase light up. Because no wall clock is involved, `reset` → `run demo`
+produces the same phases, events and final metrics every time, and pausing between
+beats cannot change the outcome.
+
+While a demo is running or paused, the three manual actions that would contaminate
+it — stepping, running an orchestrator cycle, executing an action — are refused with
+HTTP 409. Validating an action is still allowed, because validation executes
+nothing.
+
+The impact summary at the end carries a polarity per metric (lower is better, higher
+is better, or neutral), **so it can and does report a figure getting worse.**
+
+### 13.3 The event feed
+
+Every derived event is a difference between two real engine states, or a field of a
+real M6 audit record. If nothing relevant changed between two reads, no event is
+emitted. Ten kinds are derived — `DEMAND_SURGE`, `CONGESTION_DETECTED`,
+`ROUTE_ADAPTATION`, `SWARM_FORMED`, `SWARM_SPLIT`, `DEMAND_IMBALANCE`,
+`FLEET_REBALANCING`, `GEMINI_PROPOSAL`, `VALIDATION`, `EXECUTION` — and four are
+**inputs rather than findings**, named separately so they cannot be mistaken for
+them: `SIMULATION_INIT`, `SCENARIO_LOADED`, `TRAFFIC_INJECTED`, `DEMO_INPUT`.
+
+The thresholds are documented constants, not dials tuned to make a demo look busy:
+an edge is congested at 80 % utilization and must fall back below 70 % before it can
+alert again; a demand surge needs the forecast to rise by at least 2 trips **and**
+by at least 50 % of the previous forecast; a node counts as imbalanced at 1 pod
+short. Event ids are `EVT-00001` upward in emission order — positional, never a
+Python `hash()`. The deriver is read-only with respect to the simulation.
+
+### 13.4 The frontend
+
+React 19 + TypeScript + Vite 6 + Tailwind 3, tested with vitest and
+`@testing-library/react` under jsdom. It holds no simulation logic: it fetches,
+renders, and sends operator inputs.
+
+| Path | Holds |
+|---|---|
+| `src/App.tsx` | the shell: session state, the playback loop, wiring between panels |
+| `src/api/client.ts` | the single `api` object — every `fetch` in the app lives here |
+| `src/types/api.ts` | the TypeScript mirror of the API's JSON shapes |
+| `src/map/CityMap.tsx` | the city, pods, edges and swarms |
+| `src/panels/` | `TopBar`, `TopMetricBar`, `SimulationControls`, `GeminiOrchestratorPanel`, `EventTimeline`, `UrbanImpactPanel`, `ScenarioComparisonModal` |
+| `src/components/` | `DemoController`, `StartupSequence` |
+
+"Play" is a loop that calls `/api/simulation/step`, so the clock on screen is the
+engine's tick, not an animation running alongside it. At the fastest speed setting
+the loop is capped at one request every 80 ms.
+
+`UrbanImpactPanel` reads the engine's own `road_occupancy_saved_equiv_km` and shows
+it in **equiv-km** — single-pod-equivalent road space, which §10 keeps textually
+distinct from physical kilometres driven. The panel's own footnote states that
+targets such as "up to 40 % urban road space reclaimed" are **prospective planning
+models** resting on a theoretical headway-compression assumption, and **not measured
+claims of this synthetic run**. Nothing in this repository has achieved, measured or
+demonstrated such a reduction.
+
+### 13.5 MOCK GEMINI versus LIVE GEMINI
+
+On start-up the session reads the environment. With no `$GEMINI_API_KEY` it builds
+M6's `MockProvider`; with a key it builds `GeminiProvider`, and if that construction
+fails for any reason it logs the failure and falls back to the mock. Which one is
+live is carried in every state payload and shown in the UI, and `/api/health`
+reports the mode from key *presence* only — it never reports a live call that did
+not happen.
+
+**MOCK GEMINI is a fixed arithmetic rule, not a language model** (§12.7): a deficit
+below threshold means `NO_ACTION`, no eligible pod means `NO_ACTION`, deadhead
+already above 40 % of all driving means `NO_ACTION`, and otherwise it requests
+rebalancing toward the worst deficit nodes. It is deterministic and reviewable, and
+it says nothing about what Gemini would choose. **No live Gemini call has been made
+from this repository's own verification runs.**
+
+Whichever provider is active, the path is unchanged: the proposal is parsed against
+the closed four-action schema, validated against the live engine (including the
+stale-observation check), and executed — if at all — by the existing M5/M3 entry
+points. The UI cannot bypass any of that.
+
+
+## 14. How to run
+
+Python 3.11+. **No installation is needed for the engine, the CLI or the API
+server** — they are standard library only. Only the frontend needs npm.
 
 ```bash
 python -m app.cli.main route --from "North Station" --to "Airport"
@@ -1404,18 +1601,51 @@ line naming the variable.
 Exit codes: `0` success, `1` no route, `2` invalid input or scenario,
 `3` A*/Dijkstra cost mismatch (should never happen).
 
-## 14. How to run tests
+### The Visual Command Center (M7)
+
+```bash
+# the API server — standard library only, no pip install needed
+python -m app.api.server                 # http://localhost:8000
+python -m app.api.server --port 9000 --host 127.0.0.1
+
+# the frontend — needs npm; node_modules/ and dist/ are gitignored
+cd frontend
+npm ci                                   # or npm install, the first time
+npm test                                 # vitest run
+npm run build                            # tsc && vite build -> frontend/dist/
+npm run dev                              # Vite on :5173, proxying /api to :8000
+```
+
+Two ways to run it:
+
+* **Development** — `python -m app.api.server` in one shell and `npm run dev` in
+  another. Vite serves the UI on 5173 and proxies `/api` to 8000.
+* **Single port** — `npm run build` first, then `python -m app.api.server` alone. The
+  server serves `frontend/dist/` for every non-`/api` path.
+
+If `frontend/dist/` does not exist, opening `/` returns the health JSON rather than
+the UI. That means the frontend was never built, not that the server is broken.
+
+Mock mode needs no key and no network: with `$GEMINI_API_KEY` unset the session uses
+M6's deterministic `MockProvider` and the UI labels it **MOCK GEMINI** (§13.5).
+
+## 15. How to run tests
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-pytest -q
+pip install -r requirements.txt          # pytest, and nothing else
+pytest -q                                # 990 cases, roughly 2.5 minutes
+
+cd frontend && npm ci && npm test        # vitest: 5 files, 14 cases
+cd frontend && npm run build             # tsc && vite build
 ```
 
-723 test functions (981 cases with parametrization) across models, network,
+732 test functions (990 cases with parametrization) across models, network,
 routing, determinism, edge cases, route-switch regression, and the M2 demand,
-M3 fleet, M4 swarm, M5 rebalancing and M6 orchestration layers. **No test needs
-an API key, a network connection or the Gemini SDK.** Highlights: A* and Dijkstra costs match for **all 462 ordered node
+M3 fleet, M4 swarm, M5 rebalancing, M6 orchestration and M7 API layers, plus 14
+frontend component cases in 5 files. **No test needs an API key, a network
+connection or the Gemini SDK**, and the Python suite needs nothing from `frontend/`.
+Highlights: A* and Dijkstra costs match for **all 462 ordered node
 pairs**, and again under random congestion; the heuristic is checked for
 admissibility against true costs from every node to every goal.
 
@@ -1520,6 +1750,18 @@ tests assert that no lower layer imports `app.orchestration`, that no module in 
 imports an SDK at module scope, that `app/rebalancing/` was not modified, and that M6
 introduces no second cost or congestion model.
 
+M7 contributes 9 test functions in `tests/test_api_server.py`, covering session
+initialisation and the state payload, stepping, the orchestration cycle through the
+session's `OrchestrationAPI`, and the demo and event paths. They drive
+`SimulationSession` directly rather than over a socket, so no port is bound and no
+HTTP client is needed.
+
+The frontend's 14 cases in 5 files (`frontend/src/__tests__/`) cover `CityMap`,
+`GeminiOrchestratorPanel`, `SimulationControls`, `TopMetricBar` and
+`UrbanImpactPanel` with `@testing-library/react` under jsdom. They render components
+against fixture props; they do not start the API server, and `npm run build` runs
+`tsc` first, so a type error fails the build rather than only the lint.
+
 `tests/test_route_switch_regression.py` (M1.1) pins the end-to-end behaviour that
 congestion can change the chosen route. On the seed-42 baseline,
 North Station -> East Hub is normally `E009 -> E011` via Northgate Junction
@@ -1531,9 +1773,10 @@ route is genuinely cheaper under the modified costs, that Dijkstra and A* still
 agree before/after/restored, that repeated executions are bit-identical, and that
 restoring the original traffic restores the original route and cost exactly.
 
-## 15. Known limitations
+## 16. Known limitations
 
-* Synthetic data only; no calibration against real traffic.
+* Synthetic data only; **no calibration against real traffic, real mobility data or
+  any real city**, and no real-world performance is claimed anywhere.
 * Vehicle counts are static inputs — there is no traffic propagation, queueing,
   signal timing, turn penalties or time-of-day variation.
 * Travel time is computed at query time; a long trip does not see congestion
@@ -1669,10 +1912,58 @@ M6 orchestration:
   and nothing else.
 * Only `REQUEST_REBALANCING` touches the live simulation. `RUN_SIMULATION` and
   `COMPARE_SCENARIOS` start fresh deterministic runs and leave the current one alone.
-* There is no UI. §12.12 is the interface a UI would sit on; the dashboard is not
-  built.
 
-## 16. Future milestones
+M7 / M7.2 Visual Command Center:
+
+* **`/api/comparison` does not use the engine's road-space metric, and its figure
+  should not be quoted.** The endpoint derives
+  `impact_summary.road_space_saved_equiv_km` as
+  `baseline.pod_distance_km − swarm.pod_distance_km × 0.85`, a hardcoded factor that
+  appears nowhere in the engine, and in doing so differences physical kilometres
+  against a scaled quantity and labels the result `equiv_km` — exactly the unit mix
+  §10 forbids. `ScenarioComparisonModal` displays it. The live `UrbanImpactPanel`,
+  by contrast, reads M4's real `road_occupancy_saved_equiv_km`. Treat the comparison
+  modal's road-space number as unverified presentation, not an engine result, until
+  it is changed to read the published metric.
+* **No road-space reduction has been achieved, measured or demonstrated here.** The
+  "up to 40 %" figure the UI mentions is a prospective planning assumption resting on
+  a theoretical headway-compression factor, and the panel says so on screen. §10's
+  occupancy saving is an estimate derived from `formation_occupancy_factor` and is
+  explicitly not an aerodynamic, fuel, energy or emissions saving.
+* **No live Gemini call has been made from this repository's own verification runs.**
+  `$GEMINI_API_KEY` was unset throughout, so the live provider's network path is
+  exercised only through an injected stub client; everything reported was produced by
+  MOCK GEMINI.
+* **One process-wide session, and no authentication.** The server holds a single
+  simulation guarded by a lock, so it serves one operator at a time; a second browser
+  shares and perturbs the same state. There is no login, no CSRF protection, no rate
+  limiting and no TLS. It binds all interfaces by default. **Run it on localhost
+  only; it is not hardened for exposure to a network.**
+* The UI has no persistence. Reloading the page re-reads the server's current state,
+  and restarting the server loses the session, the audit log and the event feed.
+* **Not every read takes the operation lock.** `/api/simulation/state`,
+  `/api/simulation/events` and `/api/demo/state` hold it, and every POST does, but
+  `/api/network`, `/api/demand-map`, `/api/comparison` and the three orchestrator
+  reads do not. The server is threaded, so a read issued while a POST is mutating
+  the simulation can observe it part-way through. In practice the UI polls from one
+  browser between its own writes, so this has not been seen to bite — but it is a
+  real gap, not a guarantee.
+* `/api/comparison` runs three 180-minute simulations synchronously inside the
+  request. For its fixed 60-pod / 400-passenger spec that measured about 0.2 s here,
+  so it is not slow today; it would be if the spec grew.
+* The event feed is in-memory only. The deriver accumulates events for the life of
+  the session and `/api/simulation/events` replays them, but nothing is written to
+  disk: a server restart or `/api/simulation/reset` loses the feed. Events are also
+  only derived when something calls the deriver (a step, a cycle, a demo beat), so
+  the feed reflects what was driven, not a continuous watch.
+* Demo Mode is one fixed script over one fixed start state. A phase whose gate is not
+  met inside its beat budget is reported `not_observed` — honest, but it means the
+  demo does not guarantee that every phase will be demonstrated on every run.
+* The frontend's tests render components against fixture props. There is no
+  end-to-end test that starts the API server and drives the real UI, so the contract
+  between `src/types/api.ts` and the server's JSON is maintained by hand.
+
+## 17. Future milestones
 
 * **M1** — deterministic city + network foundation ✅
 * **M1.1** — route-switch regression validation ✅
@@ -1682,16 +1973,23 @@ M6 orchestration:
 * **M4.1** — swarm metric semantics audit ✅
 * **M5** — adaptive fleet rebalancing and the M6 boundary ✅
 * **M6** — Gemini orchestration and validated AI control ✅
-* Later — the visual dashboard, and impact comparison on top of §12.12's API.
+* **M7** — stdlib HTTP adapter and the React Visual Command Center ✅
+* **M7.2** — deterministic Demo Mode and the derived event feed ✅
+* Not started — nothing beyond M7.2. The nearest known work is correcting
+  `/api/comparison` to read M4's published occupancy metric instead of its hardcoded
+  factor (§16), and an end-to-end test across the server and the real UI.
 
-**M5 completes the deterministic engine; M6 adds the only thing above it.**
-Everything through M5 is reproducible from a seed, uses only the Python standard
-library, and runs offline — and all of that is still true with M6 in place. The
-orchestrator observes through a read-only snapshot and proposes bounded actions that
-a deterministic validator checks before the engine acts. It cannot mutate simulation
-state, cannot widen its own bounds, and cannot execute anything. **Gemini is an
-orchestrator, not the simulation engine.**
+**M5 completes the deterministic engine. M6 is the only thing that proposes, and M7
+is the only thing that displays.** Everything through M5 is reproducible from a seed,
+uses only the Python standard library and runs offline — and all of that is still
+true with M6 and the M7 API server in place, since both are standard library too.
+The orchestrator observes through a read-only snapshot and proposes bounded actions
+that a deterministic validator checks before the engine acts. It cannot mutate
+simulation state, cannot widen its own bounds, and cannot execute anything. The
+frontend cannot either: it reaches Python only over HTTP, and every endpoint it can
+call goes through the same validator. **Gemini is an orchestrator, not the simulation
+engine.**
 
 The pipeline is `passenger demand → trip requests → routing → pod grouping → swarm
 formation`, with rebalancing closing the loop back to demand. M1–M5 implement all of
-it deterministically.
+it deterministically; M6 proposes against it and M7 shows it.
