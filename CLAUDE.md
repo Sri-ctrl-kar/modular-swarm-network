@@ -5,9 +5,10 @@ A* admissibility proof and the synthetic-city assumptions.
 
 ## Status
 
-Milestones 1, 1.1, 2, 3, 4, 4.1, 5, 6, 7 and 7.2 are complete and green at
-`v0.7.2-demo` (`12515ae`): **990 Python cases** (732 test functions) and **14 frontend
-cases** (5 files), all passing; `npm run build` succeeds.
+Milestones 1, 1.1, 2, 3, 4, 4.1, 5, 6, 7 and 7.2 are complete and green: **997
+Python cases** (739 test functions) and **14 frontend cases** (5 files), all passing;
+`npm run build` succeeds. The `v0.7.2-demo` tag marks `12515ae`; the branch has moved
+on since, so re-read the counts rather than trusting the tag.
 
 **M5 completes the deterministic engine. M6 is the orchestration boundary above it.
 M7/M7.2 is the Visual Command Center — an HTTP adapter and a React frontend — above
@@ -58,7 +59,7 @@ Python engine, CLI and API (no third-party runtime dependency):
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # pytest only; runtime is stdlib-only
-pytest -q                                # 990 cases, ~145 s
+pytest -q                                # 997 cases, ~2.5 min
 python -m app.cli.main route --from "North Station" --to "Airport" --algorithm both
 python -m app.cli.main congestion-demo --from "North Station" --to "Airport"
 python -m app.cli.main info
@@ -228,6 +229,17 @@ server is broken.
    scoring model, must not re-derive a metric the engine already publishes, and must
    reach the orchestrator only through M6's `OrchestrationAPI` — never by building
    an `AIAction` and executing it itself, and never past `ActionValidator`.
+   **A concrete instance, and the lesson it carries.**
+   `/api/comparison` used to synthesise road space as
+   `max(0, baseline.pod_distance_km - swarm.pod_distance_km * 0.85)`. That 0.85
+   appears nowhere in the engine; the expression differenced physical km against a
+   scaled quantity, labelled the result `equiv_km`, and differenced across two runs
+   that serve different trip sets. It displayed 44.029 equiv-km on the endpoint's own
+   spec where M4's figure was 0.000. **It was a synthesized formula and was never
+   valid.** The cause was that `ScenarioResult` carried no occupancy field, so there
+   was nothing canonical to read: when a figure is missing, plumb the engine's metric
+   through, never invent one.
+   See invariant 11 for the units and §"Road space" below for the current rule.
 22. **Events are differences between real states, never timers.** Every kind in
    `DERIVED_KINDS` is emitted only when two successive reads of real engine state
    differ, or when a real M6 audit record says so; if nothing relevant changed,
@@ -349,7 +361,7 @@ arrivals. `PodStatus` is unchanged.
 | `actions.py` | `AIActionType` (the whitelist), `AIAction`, `ParsedAction`, `parse_action`, `clean_text` |
 | `validator.py` | `OrchestrationValidator`, `ValidationVerdict`, `Verdict`, every `REJECT_*` code |
 | `execution.py` | `ActionExecutor`, `ExecutionResult`, `ExecutionStatus` — mapping actions onto M5/M3 |
-| `scenarios.py` | `ScenarioSpec`, `run_scenario`, `build_simulation`, `EVALUATION_SCENARIOS` A/B/C |
+| `scenarios.py` | `ScenarioSpec`, `run_scenario`, `build_simulation`, `EVALUATION_SCENARIOS` A/B/C; `ScenarioResult` also publishes M4's `road_occupancy_*` fields and `swarm_count` |
 | `providers/` | `base.py` (the protocol), `mock.py` (`MockProvider`, `ScriptedProvider`), `gemini.py` |
 | `prompt.py` | `SYSTEM_PROMPT`, `RESPONSE_SCHEMA`, `build_user_payload` |
 | `orchestrator.py` | `Orchestrator.run_cycle` / `run_cycles` — the bounded loop |
@@ -428,6 +440,53 @@ Things to know before changing anything:
 * `tests/test_api_server.py` drives `SimulationSession` directly rather than over a
   socket, so it is fast and needs no port. Keep new API tests that way.
 
+### Road space
+
+The rule, and the only acceptable source:
+
+* **Read `road_occupancy_saved_equiv_km` and `road_occupancy_saving_percent` from
+  M4**, via `ScenarioResult` (whose fields `run_scenario` copies out of
+  `compute_swarm_metrics` unaltered) or via a live run's `compute_swarm_metrics`.
+  `_road_space_entry` and `_road_space_summary` in `app/api/server.py` select and
+  label those fields; the only computation in that path is
+  `available = pod_distance_km > 0.0`. Keep it that way.
+* **Units.** `saved_equiv_km = pod_distance_km - road_occupancy_equiv_km`, in
+  single-pod-equivalent km. Both operands are equiv-km: `pod_distance_km` enters as
+  *occupancy if nothing platooned*, at the 1.0 equiv-km-per-km identity that
+  `tests/test_swarm_metric_semantics.py` asserts. The percentage divides that by the
+  **same run's** pod-km, so it is dimensionless.
+* **Never difference it across runs.** `cross_run_difference_equiv_km` is always
+  `null` and `cross_run_comparable` always `false`, because the modes serve different
+  trip sets (the formation delay shifts departures). Only the scale-free percentage
+  compares between runs — invariant 11's rule, enforced here.
+* **Zero is a real answer; undefined is a different one.** No formations means
+  exactly `0.0` with a `zero_reason`; a run that drove no distance means
+  `available: false` with an `unavailable_reason`, not a zero. Do not collapse the
+  two, and do not substitute a plausible-looking number for either.
+
+#### Measured results versus the planning target — keep these apart
+
+Measured by this repository, on the comparison's 60-pod / 400-passenger spec:
+
+| run | horizon | saving |
+|---|---|---|
+| any of the three modes | 180 min (the endpoint's own) | **0.0 %** — no swarm forms |
+| swarm mode | full day | **1.3 %** |
+| adaptive mode | full day | **2.84 %** |
+| adaptive mode | 600 min | **4.71 %** — the largest measured |
+
+The 180-minute zero is correct, not a bug: the baseline profile's morning peak starts
+at minute 360 and the first formation occurs at **minute 372**, so the horizon ends
+before two pods are ever assigned at the same node.
+
+The **"up to 40 % urban road space reclaimed"** figure in `UrbanImpactPanel` is a
+**prospective planning assumption**, resting on a theoretical headway-compression
+factor, and the panel says so on screen. It is not a result, it has not been measured
+here, and it must never be presented as achieved. Nor is any of this validated
+against the real world: the city, demand and `formation_occupancy_factor = 0.4` are
+invented (invariants 7 and 11), the saving is a road-space *estimate* and not a fuel,
+energy, emissions or time saving, and no real-world performance may be claimed.
+
 ## Deterministic Demo Mode and the event feed (M7.2)
 
 Demo Mode is a fixed sequence of **inputs** over the real simulation, with **phase
@@ -487,6 +546,13 @@ Things to know before changing anything:
   running separately in development.
 * The UI must not restate an engine number it did not fetch, and must not present the
   AI's `expected_effect` as a result — M6 keeps those apart, and so must the panels.
+* **Road space, in both panels, comes from M4's metric.** `UrbanImpactPanel` reads a
+  live run's `road_occupancy_saved_equiv_km`; `ScenarioComparisonModal` reads
+  `impact_summary.road_space.per_run.swarm` and renders `n/a` with the server's
+  reason when it is unavailable. Neither may compute a saving, and the modal must
+  keep showing the server's `cross_run_note` and `semantics` strings rather than
+  implying a cross-mode difference. The panel's own footnote about the prospective
+  40 % target must stay labelled as a planning assumption — see §"Road space" above.
 
 ## When starting the next milestone
 
