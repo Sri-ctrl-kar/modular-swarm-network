@@ -5,9 +5,14 @@ A* admissibility proof and the synthetic-city assumptions.
 
 ## Status
 
-Milestones 1, 1.1, 2, 3, 4, 4.1, 5 and 6 are complete and green: 723 test functions /
-981 parametrized cases, all passing. **M5 completes the deterministic engine; M6 is
-the orchestration layer above it.**
+Milestones 1, 1.1, 2, 3, 4, 4.1, 5, 6, 7 and 7.2 are complete and green at
+`v0.7.2-demo` (`12515ae`): **990 Python cases** (732 test functions) and **14 frontend
+cases** (5 files), all passing; `npm run build` succeeds.
+
+**M5 completes the deterministic engine. M6 is the orchestration boundary above it.
+M7/M7.2 is the Visual Command Center — an HTTP adapter and a React frontend — above
+that.** The engine is still the source of truth: every number the UI shows is read
+from M1-M6, and M6's `OrchestrationAPI` is the only way anything reaches the engine.
 
 * **M1** — deterministic city + network foundation.
 * **M1.1** — `tests/test_route_switch_regression.py`: congestion can change the
@@ -33,17 +38,27 @@ the orchestration layer above it.**
   lazily imported. **M1-M5 were not modified** — the engine is byte-for-byte
   identical to the M5 commit, and tests pin the layering and the boundary contract
   that keep it that way.
+* **M7** — `app/api/`: a **stdlib-only** HTTP adapter (`http.server`, no FastAPI, no
+  Flask, no requests) over the engine, and `frontend/`: a React + TypeScript + Vite
+  Visual Command Center that talks to it over JSON. The UI reaches the orchestrator
+  only through M6's `OrchestrationAPI`.
+* **M7.2** — `app/api/demo.py` (a deterministic scripted Demo Mode) and
+  `app/api/events.py` (an event feed derived from real state differences), plus the
+  frontend panels that show them.
 
-Next is the **visual dashboard / UI**, which is not started. Do not build HTTP,
-FastAPI, Streamlit, React or Antigravity UI code. A UI would sit on
-`app/orchestration/api.py`'s six pure-Python operations.
+The UI **is built** — do not write it again, and do not describe it as absent. The
+next milestone is **not started**; do not begin it without being asked. Before
+changing anything here, read §"The M7 API adapter" and §"The M7 frontend" below:
+they record which parts are load-bearing.
 
 ## Commands
+
+Python engine, CLI and API (no third-party runtime dependency):
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # pytest only; runtime is stdlib-only
-pytest -q
+pytest -q                                # 990 cases, ~145 s
 python -m app.cli.main route --from "North Station" --to "Airport" --algorithm both
 python -m app.cli.main congestion-demo --from "North Station" --to "Airport"
 python -m app.cli.main info
@@ -59,14 +74,41 @@ pip install -r requirements-gemini.txt   # OPTIONAL, live Gemini only
 python -m app.cli.main ai-demo --provider gemini   # needs $GEMINI_API_KEY
 ```
 
+The Visual Command Center (M7). The API server is stdlib-only; only the frontend
+needs npm, and `frontend/node_modules/` and `frontend/dist/` are gitignored:
+
+```bash
+python -m app.api.server                 # serves http://localhost:8000 (--host, --port)
+
+cd frontend
+npm ci                                   # or npm install, the first time
+npm test                                 # vitest run — 5 files, 14 cases
+npm run build                            # tsc && vite build -> frontend/dist/
+npm run dev                              # Vite on :5173, proxying /api to :8000
+```
+
+Two ways to run the UI. In development, `npm run dev` serves the frontend on 5173
+and proxies `/api` to the Python server on 8000 (`frontend/vite.config.ts`). For a
+single-port run, `npm run build` first: the API server serves `frontend/dist/` for
+any non-`/api` path, and falls back to the health JSON when `dist/` is absent — so a
+browser showing raw JSON at `/` means the frontend was never built, not that the
+server is broken.
+
 ## Invariants — do not break these
 
-1. **Stdlib only at runtime.** No Streamlit, FastAPI, NetworkX, requests, DB or
-   external APIs. pytest is test-only. The **one** permitted exception is M6's
-   optional `google-genai`, which lives in `requirements-gemini.txt`, is imported
-   inside `GeminiProvider.__init__` and is never needed by the engine, the mock
-   path or the test suite — a test asserts no module in `app/orchestration/`
-   imports an SDK at module scope.
+1. **Stdlib only in Python at runtime, frontend deps stay in the frontend.** No
+   Streamlit, FastAPI, Flask, NetworkX, requests, DB or external APIs anywhere under
+   `app/` — **including `app/api/`, which is built on `http.server` and must stay
+   that way**. `requirements.txt` is still pytest-only. Two bounded exceptions:
+   * M6's optional `google-genai` in `requirements-gemini.txt`, imported inside
+     `GeminiProvider.__init__`, never needed by the engine, the mock path or the
+     test suite — a test asserts no module in `app/orchestration/` imports an SDK
+     at module scope;
+   * `frontend/`'s npm toolchain (React, Vite, Tailwind, vitest), which is a
+     **separate build**, never imported by Python, and whose `node_modules/` and
+     `dist/` are gitignored.
+   So `pytest -q` and every CLI command must keep working with nothing installed
+   but pytest, on a checkout where `frontend/` was never touched.
 2. **Determinism.** Same seed → byte-identical scenario JSON; same input →
    identical `Route`. Tie-breaking is by node id; adjacency keeps insertion
    order. `scenarios/baseline.json` must stay byte-identical to
@@ -86,10 +128,12 @@ python -m app.cli.main ai-demo --provider gemini   # needs $GEMINI_API_KEY
 4. **Assumptions live in `app/config.py`** and the scenario file, not inside
    algorithms. No magic numbers in routing or graph code.
 5. **Layering:** models ← network ← routing ← simulation ← demand ← fleet ←
-   swarm ← rebalancing ← orchestration ← cli. Never import downward-to-upward:
-   nothing below a layer may import `app.demand`, `app.fleet`, `app.swarm`,
-   `app.rebalancing` or `app.orchestration` (tests walk the lower layers to enforce
-   all five).
+   swarm ← rebalancing ← orchestration ← {cli, api} ← frontend. Never import
+   downward-to-upward: nothing below a layer may import `app.demand`, `app.fleet`,
+   `app.swarm`, `app.rebalancing` or `app.orchestration` (tests walk the lower
+   layers to enforce all five). `app/api/` and `app/cli/` are siblings at the top of
+   the Python stack: neither imports the other, and nothing under `app/` imports
+   `app.api`. The frontend sits above everything and reaches Python only over HTTP.
 6. **Typed errors only** (`app/errors.py`); the CLI turns them into one clean
    line on stderr with exit code 1 (no route) or 2 (invalid input).
 7. **Synthetic data must stay labelled as synthetic.** No real-world
@@ -176,7 +220,28 @@ python -m app.cli.main ai-demo --provider gemini   # needs $GEMINI_API_KEY
    handed to the SDK client and never stored, logged, printed, fingerprinted or put
    in a prompt; `describe()` reports presence only. And there is deliberately **no
    "AI accuracy" metric** — the heuristic it invokes is not claimed optimal, so
-   there is no ground truth. Count process; take outcomes from the engine.
+   there is no ground truth. Count process; take outcomes from the engine. This
+   extends to the API: `/api/health` reports `gemini_mode` from key *presence*, and
+   a UI badge saying LIVE GEMINI must never be shown for a mock run.
+21. **The API adapter adapts; it does not compute.** `app/api/` reads the engine and
+   serialises it. It must not add a cost, congestion, battery, forecasting or
+   scoring model, must not re-derive a metric the engine already publishes, and must
+   reach the orchestrator only through M6's `OrchestrationAPI` — never by building
+   an `AIAction` and executing it itself, and never past `ActionValidator`.
+22. **Events are differences between real states, never timers.** Every kind in
+   `DERIVED_KINDS` is emitted only when two successive reads of real engine state
+   differ, or when a real M6 audit record says so; if nothing relevant changed,
+   `observe()` returns `[]`. Lifecycle and operator inputs
+   (`SIMULATION_INIT`, `SCENARIO_LOADED`, `TRAFFIC_INJECTED`, `DEMO_INPUT`) are
+   **separately named and must stay separately named**, because they are inputs, not
+   findings. Never emit an event because time passed or because a demo phase wanted
+   one on screen.
+23. **Demo Mode is a script of inputs, not a recording.** It injects operator inputs
+   into the real simulation and then *waits* for the matching derived event; a phase
+   whose gate is not met inside its beat budget is reported `not_observed` and the
+   machine moves on. Never fake an event, extend a budget, or tune a threshold to
+   make a phase light up. There is no wall-clock anywhere in it, so
+   `reset -> run demo` must stay reproducible.
 
 ## The M2 demand layer
 
@@ -314,13 +379,121 @@ Things to know before changing anything:
   deficit; no deficit; a real deficit that is already too expensive to chase). If you
   change fleet sizes or warm-up minutes, re-check that each still poses what it claims.
 
-## When starting the UI
+## The M7 API adapter
 
-The dashboard is the next milestone and is **not started**. It must sit on
-`app/orchestration/api.py`'s six operations — `get_observation`, `propose_action`,
-`validate_action`, `execute_action`, `get_result`, `get_audit_log` — which already
-return JSON-serialisable plain values, so an HTTP adapter over them should carry no
-logic of its own. Do not reach past that façade into the engine, do not add a second
-validator, and do not let a UI control widen `PARAMETER_BOUNDS` or the orchestration
-bounds. Build a new package; do not modify `app/rebalancing/` or `app/orchestration/`
-beyond what the UI genuinely needs, and keep every invariant above.
+`app/api/` sits on top of `app/orchestration/` and is organised as:
+
+| Module | Holds |
+|---|---|
+| `server.py` | `SimulationSession`, `VisualCommandCenterHandler`, `run_server` — routes, serialisation, static files |
+| `demo.py` | `DemoRunner`, `PHASES`, `IMPACT_METRICS` and the demo's fixed constants |
+| `events.py` | `EventDeriver`, the event kinds, `DERIVED_KINDS`, the congestion/surge thresholds |
+| `__init__.py` | re-exports `run_server` only |
+
+Everything is stdlib: `http.server.ThreadingHTTPServer`, `json`, `urllib.parse`,
+`mimetypes`. `DualStackServer` binds `::` and falls back to IPv4.
+
+Routes. GET: `/api` and `/api/health`, `/api/network`, `/api/scenarios`,
+`/api/simulation/state`, `/api/simulation/events`, `/api/demo/state`,
+`/api/demand-map`, `/api/orchestrator/observation`, `/api/orchestrator/audit`,
+`/api/orchestrator/result`, `/api/comparison`; anything else under `/api/` is a 404,
+and anything outside it is served from `frontend/dist/`. POST:
+`/api/simulation/init`, `/api/simulation/step`, `/api/simulation/reset`,
+`/api/simulation/set-traffic`, `/api/route-switch`, `/api/orchestrator/cycle`,
+`/api/orchestrator/validate`, `/api/orchestrator/execute`, `/api/demo/start`,
+`/api/demo/advance`, `/api/demo/pause`, `/api/demo/resume`.
+
+Things to know before changing anything:
+
+* **One process-wide session.** `_session` is a single `SimulationSession` guarded by
+  `_session_lock` (creation) and `_op_lock`, an `RLock` held across each mutating
+  request. The server is threaded, so a handler that touches the simulation must hold
+  `_op_lock`; dropping it would let two requests tick the same engine at once and
+  destroy determinism.
+* **`/api/simulation/reset` restores the current scenario's exact initial state** by
+  re-running `_init_simulation()`, and leaves Demo Mode. Keep that true: the demo's
+  reproducibility claim rests on `reset -> run demo`.
+* **The three manual actions are refused during a demo.** `step`,
+  `orchestrator/cycle` and `orchestrator/execute` raise `_DemoBusy` -> HTTP 409 while
+  a demo is `running` or `paused` (`_reject_if_demo`), so a demo run cannot be
+  contaminated half way through. `validate` is allowed, because it executes nothing.
+* **Provider choice is automatic and must stay honest.** `_init_simulation` builds a
+  `GeminiProvider` when `api_key_status()` reports a key and falls back to
+  `MockProvider` on any failure, logging the fallback; `provider_type` and
+  `gemini_label` carry which one is live. Never label a mock run as live.
+* `/api/scenarios` lists the three standard scenarios (`baseline`, `peak_hour`,
+  `DEMO_MORNING_RUSH`) plus M6's three evaluation scenarios, each with its
+  `expected_consideration`. Scenario definitions live in M6 and M2 — the list here is
+  presentation, so add a scenario in its own layer first.
+* `tests/test_api_server.py` drives `SimulationSession` directly rather than over a
+  socket, so it is fast and needs no port. Keep new API tests that way.
+
+## Deterministic Demo Mode and the event feed (M7.2)
+
+Demo Mode is a fixed sequence of **inputs** over the real simulation, with **phase
+gates** on real derived events. The start state is fully specified
+(`DEMO_SCENARIO_ID = "DEMO_MORNING_RUSH"`, 40 pods, 600 passengers, from
+`DEMO_START_MIN = 360.0` — the quiet minutes before the morning ramp), and the beats
+are counted, not timed: `TICKS_PER_BEAT = 2`, `MAX_BEATS_PER_PHASE = 45`,
+`BASELINE_BEATS = 2`, `IMPACT_BEATS = 10`, with one scripted traffic injection at
+`INJECT_UTILIZATION = 1.5`.
+
+The eight phases are `BASELINE`, `DEMAND_SURGE`, `CONGESTION`, `ROUTING`, `SWARM`,
+`REBALANCING`, `GEMINI`, `IMPACT`. Each names the derived events that gate it; a
+phase is `complete` only once those events have actually been produced, and
+`not_observed` if its budget runs out. `IMPACT_METRICS` carries a polarity per metric
+(`-1` lower is better, `+1` higher, `0` neutral) so the impact panel can say a figure
+got **worse** — which it must be allowed to do.
+
+The feed is derived in `events.py`. Ten kinds are state differences
+(`DEMAND_SURGE`, `CONGESTION_DETECTED`, `ROUTE_ADAPTATION`, `SWARM_FORMED`,
+`SWARM_SPLIT`, `DEMAND_IMBALANCE`, `FLEET_REBALANCING`, `GEMINI_PROPOSAL`,
+`VALIDATION`, `EXECUTION`); four are inputs (`SIMULATION_INIT`, `SCENARIO_LOADED`,
+`TRAFFIC_INJECTED`, `DEMO_INPUT`). Ids are `EVT-00001` upward in emission order —
+positional, never a Python `hash()`.
+
+The thresholds are documented constants, not dials: `CONGESTION_THRESHOLD = 0.80`
+with hysteresis at `CONGESTION_CLEAR = 0.70` (an edge must fall below it before it
+can alert again), `SURGE_MIN_ABS_TRIPS = 2.0` **and** `SURGE_MIN_REL = 0.50` together,
+and `IMBALANCE_MIN_DEFICIT = 1.0`. `EventDeriver` is read-only with respect to the
+simulation: it keeps only what it needs to spot a transition (previous swarm
+statuses, previous reposition ids, which edges are currently over the threshold).
+Changing any threshold changes which events a given run produces, so treat them as
+part of the contract.
+
+## The M7 frontend
+
+`frontend/` is React 19 + TypeScript + Vite 6 + Tailwind 3, tested with vitest and
+`@testing-library/react` under jsdom. It holds no simulation logic: it fetches,
+renders and sends operator inputs.
+
+| Path | Holds |
+|---|---|
+| `src/App.tsx` | the shell: polling, session state, wiring between panels |
+| `src/api/client.ts` | the single `api` object — every `fetch` lives here, under `/api` |
+| `src/types/api.ts` | the TypeScript mirror of the API's JSON shapes |
+| `src/map/CityMap.tsx` | the city, pods, edges and swarms |
+| `src/panels/` | `TopBar`, `TopMetricBar`, `SimulationControls`, `GeminiOrchestratorPanel`, `EventTimeline`, `UrbanImpactPanel`, `ScenarioComparisonModal` |
+| `src/components/` | `DemoController`, `StartupSequence` |
+| `src/__tests__/` | five component suites, 14 cases |
+
+Things to know before changing anything:
+
+* **All network access goes through `src/api/client.ts`.** Add an endpoint there, not
+  a bare `fetch` in a component, and mirror its shape in `src/types/api.ts`.
+* **`npm run build` runs `tsc` first**, so a type error fails the build, not just the
+  lint. Run `npm test && npm run build` before claiming the frontend works.
+* `npm run dev` proxies `/api` to `127.0.0.1:8000`, so the Python server must be
+  running separately in development.
+* The UI must not restate an engine number it did not fetch, and must not present the
+  AI's `expected_effect` as a result — M6 keeps those apart, and so must the panels.
+
+## When starting the next milestone
+
+Nothing beyond M7.2 is started, and nothing here should be started unasked. Whatever
+comes next, the rules above still hold: the engine stays the source of truth, the
+orchestrator reaches it only through `app/orchestration/api.py`, `app/api/` stays
+stdlib-only and free of models of its own, events stay differences between real
+states, and the demo stays a script of inputs that is allowed to report a phase as
+`not_observed` and a metric as worse. Do not modify `app/rebalancing/`, and keep
+`pytest -q` green with pytest as the only installed package.
