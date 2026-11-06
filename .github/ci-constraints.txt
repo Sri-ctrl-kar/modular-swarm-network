@@ -1,0 +1,16 @@
+# Exact test-tool versions CI installs, applied to requirements.txt as a pip
+# constraints file (pip install -c). This file exists so that a CI run is
+# reproducible without changing requirements.txt, which deliberately states a
+# floor (pytest>=7.4) rather than a pin: the engine, the CLI and the API are
+# stdlib-only, so a contributor may use any pytest from 7.4 upward.
+#
+# A constraint narrows what pip may resolve; it never adds a package. So CI still
+# installs exactly what requirements.txt asks for, at this version.
+#
+# This is the version the suite was last verified green against locally:
+# 997 passed on Python 3.11.18.
+pytest==9.2.0
+
+# For reference, the rest of what that green run resolved (pytest's own transitive
+# dependencies, left unpinned because they carry no test semantics of their own):
+#   iniconfig==2.3.1  packaging==26.3  pluggy==1.7.0  Pygments==2.21.0
