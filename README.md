@@ -1635,13 +1635,13 @@ M6's deterministic `MockProvider` and the UI labels it **MOCK GEMINI** (§13.5).
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt          # pytest, and nothing else
-pytest -q                                # 990 cases, roughly 2.5 minutes
+pytest -q                                # 997 cases, roughly 2 minutes
 
 cd frontend && npm ci && npm test        # vitest: 5 files, 14 cases
 cd frontend && npm run build             # tsc && vite build
 ```
 
-732 test functions (990 cases with parametrization) across models, network,
+739 test functions (997 cases with parametrization) across models, network,
 routing, determinism, edge cases, route-switch regression, and the M2 demand,
 M3 fleet, M4 swarm, M5 rebalancing, M6 orchestration and M7 API layers, plus 14
 frontend component cases in 5 files. **No test needs an API key, a network
@@ -1751,11 +1751,17 @@ tests assert that no lower layer imports `app.orchestration`, that no module in 
 imports an SDK at module scope, that `app/rebalancing/` was not modified, and that M6
 introduces no second cost or congestion model.
 
-M7 contributes 9 test functions in `tests/test_api_server.py`, covering session
+M7 contributes 16 test functions in `tests/test_api_server.py`. Nine cover session
 initialisation and the state payload, stepping, the orchestration cycle through the
-session's `OrchestrationAPI`, and the demo and event paths. They drive
-`SimulationSession` directly rather than over a socket, so no port is bound and no
-HTTP client is needed.
+session's `OrchestrationAPI`, traffic injection and the demand map. The other seven
+pin `/api/comparison`'s road-space reporting (§16): that `ScenarioResult` matches
+`compute_swarm_metrics` field for field, that a run with swarms disabled gives
+exactly `0.0` under M4's occupancy identity, that a run which really platoons equals
+the closed form `Σ d(n−1)(1−f)`, that a run which drove no distance is reported
+unavailable rather than zero, that no cross-run difference is reported, that the old
+flat `road_space_saved_equiv_km` scalar cannot reappear, and that the response still
+round-trips through JSON. All sixteen drive `SimulationSession` directly rather than
+over a socket, so no port is bound and no HTTP client is needed.
 
 The frontend's 14 cases in 5 files (`frontend/src/__tests__/`) cover `CityMap`,
 `GeminiOrchestratorPanel`, `SimulationControls`, `TopMetricBar` and
