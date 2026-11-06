@@ -1,0 +1,121 @@
+# Continuous integration for Modular Swarm Network.
+#
+# Two independent jobs, deliberately kept apart, because the separation is itself
+# a check on the repository's first invariant (see CLAUDE.md):
+#
+#   * `python-engine` installs requirements.txt (pytest and nothing else) and never
+#     touches frontend/, so a green run proves the engine, the CLI and the stdlib-only
+#     HTTP adapter still work on a checkout where npm was never run.
+#   * `frontend` installs only the npm toolchain and never installs a Python package.
+#
+# Neither job needs a secret, an API key or any external service: the test suite
+# makes no network call, and M6's Gemini path is optional and never exercised here
+# (the tests that touch $GEMINI_API_KEY set or clear it themselves via monkeypatch or
+# an explicit subprocess env, so an absent key is the expected, tested state).
+#
+# A related note for whoever edits this next: the suite's cross-process determinism
+# tests re-launch the interpreter with the environment wiped down to PATH and
+# PYTHONHASHSEED. They need nothing from the job environment and must keep needing
+# nothing, so do not add `env:` entries here expecting to reach them -- the wiped
+# environment is the point of those tests.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least privilege: every job here only reads the checkout. No job writes to the
+# repository, publishes a package, comments on a pull request or mints a token for
+# anything else, so the read-only default applies to the whole workflow.
+permissions:
+  contents: read
+
+# One in-flight run per ref. Superseded pull-request runs are cancelled; pushes to
+# main are left to finish so main keeps a complete result for every commit.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  python-engine:
+    name: Python engine (pytest)
+    # Pinned rather than ubuntu-latest, so a runner-image rollout cannot change a
+    # result on its own. Bump this deliberately.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # requirements.txt documents Python 3.11+ as the floor; 3.11 is what the
+      # project is developed against, so that is what CI pins.
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          # Both files feed the install, so both belong in the cache key: bumping
+          # the pin must not reuse a cache built from the previous one.
+          cache-dependency-path: |
+            requirements.txt
+            .github/ci-constraints.txt
+
+      # requirements.txt states a floor (pytest>=7.4), which is right for
+      # contributors but would let CI silently drift onto a newer pytest. The
+      # constraints file narrows that to the exact version the suite was verified
+      # against, leaving requirements.txt untouched. A constraint cannot add a
+      # package, so CI still installs exactly what requirements.txt asks for.
+      #
+      # No pip upgrade either: taking whatever pip is newest would make the step
+      # vary run to run for no benefit.
+      - name: Install Python dependencies
+        run: pip install -c .github/ci-constraints.txt -r requirements.txt
+
+      - name: Record the installed packages
+        run: |
+          pip list
+          pytest --version
+
+      - name: Run the Python test suite
+        run: pytest -q
+
+  frontend:
+    name: Frontend (tsc, vitest, build)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      # No "engines" field in frontend/package.json; Node 22 is the active LTS line
+      # and what @types/node ^22 and Vite 6 are aligned with.
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # npm ci installs frontend/package-lock.json exactly (lockfileVersion 3) and
+      # fails rather than resolving a newer version, which is what keeps this
+      # deterministic.
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type-check
+        run: npx tsc --noEmit
+
+      - name: Run the frontend tests
+        run: npm test
+
+      - name: Build the frontend
+        run: npm run build
